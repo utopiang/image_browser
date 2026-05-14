@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import QFileDialog, QMessageBox
 from src.config import AppConfig, save_config, load_config
 from src.models.image_list import ImageListModel
 from src.models.file_ops import FileOpsModel, OpType
+from src.models.yolo_label import YoloLabelModel
 from src.views.main_window import MainWindow
 from src.views.batch_dialog import BatchDialog
 
@@ -15,11 +16,17 @@ class AppController:
         self._config = config
         self._model = ImageListModel()
         self._file_ops = FileOpsModel()
+        self._yolo_model = YoloLabelModel()
         self._last_batch_id: int = 0
         self._last_batch_last: str = ""
 
         self._connect_signals()
         self._window.toolbar.set_recursive(config.recursive)
+        self._window.toolbar.set_labels_visible(config.label_visible)
+        self._window.toolbar.set_label_type(config.label_type)
+        if config.label_type:
+            self._yolo_model.set_label_type(config.label_type)
+        self._window.image_viewer.set_labels_visible(config.label_visible)
         self._window.resize(config.window_width, config.window_height)
         if config.last_dir:
             self._try_restore_position()
@@ -31,6 +38,10 @@ class AppController:
         tb.next_clicked.connect(self._on_next)
         tb.fit_clicked.connect(self._on_fit)
         tb.recursive_toggled.connect(self._on_recursive_toggled)
+        tb.select_label_dir_clicked.connect(self._on_select_label_dir)
+        tb.select_classes_clicked.connect(self._on_select_classes)
+        tb.toggle_labels_clicked.connect(self._on_toggle_labels)
+        tb.label_type_changed.connect(self._on_label_type_changed)
 
         sb = self._window.sidebar
         sb.mark_requested.connect(self._on_mark)
@@ -39,6 +50,7 @@ class AppController:
         sb.undo_requested.connect(self._on_undo)
         sb.batch_requested.connect(self._on_batch)
         sb.categories_changed.connect(self._on_categories_changed)
+        sb.class_filter_changed.connect(self._on_class_filter_changed)
 
         st = self._window.status_bar
         st.nav_changed.connect(self._on_nav_slider_changed)
@@ -48,6 +60,62 @@ class AppController:
         self._config.mark_categories = categories
         self._window.sidebar.set_categories(categories)
         save_config(self._config)
+
+    def _on_select_label_dir(self) -> None:
+        dir_path = QFileDialog.getExistingDirectory(
+            self._window, "选择标签文件夹", self._config.label_dir or self._config.last_dir
+        )
+        if not dir_path:
+            return
+        self._config.label_dir = dir_path
+        self._load_labels_for_current()
+        save_config(self._config)
+
+    def _on_select_classes(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self._window, "选择classes.txt", self._config.classes_file or self._config.last_dir,
+            "Text Files (*.txt)"
+        )
+        if not file_path:
+            return
+        self._config.classes_file = file_path
+        classes = self._yolo_model.load_classes(file_path)
+        self._window.sidebar.set_classes(classes)
+        self._load_labels_for_current()
+        save_config(self._config)
+
+    def _on_toggle_labels(self, visible: bool | None = None) -> None:
+        if visible is None:
+            visible = not self._yolo_model.is_visible()
+        self._yolo_model.set_visible(visible)
+        self._config.label_visible = visible
+        self._window.image_viewer.set_labels_visible(visible)
+        self._window.toolbar.set_labels_visible(visible)
+        save_config(self._config)
+
+    def _on_label_type_changed(self, label_type: str) -> None:
+        self._config.label_type = label_type
+        self._yolo_model.set_label_type(label_type)
+        self._load_labels_for_current()
+        save_config(self._config)
+
+    def _on_class_filter_changed(self, active: set[int]) -> None:
+        all_classes = set(range(len(self._yolo_model.get_classes())))
+        if active == all_classes:
+            self._yolo_model.set_active_classes(None)
+        else:
+            self._yolo_model.set_active_classes(active)
+        self._load_labels_for_current()
+
+    def _load_labels_for_current(self) -> None:
+        img = self._model.current_image
+        if not img or not self._config.label_dir:
+            return
+        label_path = FileOpsModel.get_label_path(img.path, self._config.label_dir)
+        if label_path:
+            self._yolo_model.load_label_file(label_path, img.width, img.height)
+        visible_labels = self._yolo_model.get_visible_labels()
+        self._window.image_viewer.set_labels(visible_labels, img.width, img.height)
 
     def _on_open_dir(self) -> None:
         dir_path = QFileDialog.getExistingDirectory(
@@ -101,6 +169,7 @@ class AppController:
             else:
                 self._window.status_bar.update_info(filename="(无图片)")
             return
+        self._load_labels_for_current()
         self._update_status_bar()
         self._update_sidebar_marks()
 
@@ -143,7 +212,7 @@ class AppController:
         batch_id = self._file_ops.start_batch()
         self._last_batch_id = batch_id
         self._last_batch_last = ""
-        dialog = BatchDialog(self._file_ops, batch_id, self._window)
+        dialog = BatchDialog(self._file_ops, batch_id, self._config.label_dir, self._window)
         dialog.batch_completed.connect(self._on_batch_completed)
         dialog.finished.connect(self._on_batch_finished)
         dialog.exec()
@@ -202,7 +271,7 @@ class AppController:
         img = self._model.current_image
         if not img:
             return
-        if self._file_ops.copy_image(img.path, dst_dir):
+        if self._file_ops.copy_image(img.path, dst_dir, sync_label=True, label_dir=self._config.label_dir):
             self._window.status_bar.showMessage(f"已复制到 {dst_dir}", 3000)
 
     def _on_move(self, dst_dir: str) -> None:
@@ -211,7 +280,7 @@ class AppController:
             return
         moved_path = img.path
         idx = self._model.current_index
-        if not self._file_ops.move_image(moved_path, dst_dir):
+        if not self._file_ops.move_image(moved_path, dst_dir, sync_label=True, label_dir=self._config.label_dir):
             return
         self._window.status_bar.showMessage(f"已移动到 {dst_dir}", 3000)
         self._model.images.pop(idx)
@@ -233,6 +302,10 @@ class AppController:
         self._config.window_width = self._window.width()
         self._config.window_height = self._window.height()
         self._config.target_dirs = self._window.sidebar.get_target_dirs()
+        self._config.label_dir = self._config.label_dir
+        self._config.classes_file = self._config.classes_file
+        self._config.label_type = self._config.label_type
+        self._config.label_visible = self._config.label_visible
         save_config(self._config)
 
     def _try_restore_position(self) -> None:
@@ -244,6 +317,9 @@ class AppController:
         )
         if reply == QMessageBox.StandardButton.Yes:
             self._load_directory(self._config.last_dir)
+            if self._config.classes_file:
+                classes = self._yolo_model.load_classes(self._config.classes_file)
+                self._window.sidebar.set_classes(classes)
             if 0 <= self._config.last_index < self._model.count:
                 self._model.set_index(self._config.last_index)
                 self._show_current()

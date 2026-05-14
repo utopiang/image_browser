@@ -29,7 +29,10 @@ class FileOpsModel:
         self._batch_counter += 1
         return self._batch_counter
 
-    def copy_image(self, src: str, dst_dir: str, batch_id: int = 0) -> bool:
+    def copy_image(
+        self, src: str, dst_dir: str, batch_id: int = 0,
+        sync_label: bool = False, label_dir: str = ""
+    ) -> bool:
         src_path = Path(src)
         if not src_path.exists():
             return False
@@ -38,9 +41,18 @@ class FileOpsModel:
         dst_path = dst_dir_path / src_path.name
         shutil.copy2(src, dst_path)
         self._undo_stack.append(UndoRecord(OpType.COPY, str(dst_path), dst_dir, batch_id))
+        if sync_label and label_dir:
+            label_src = self.get_label_path(src, label_dir)
+            if label_src:
+                label_dst = dst_dir_path / Path(label_src).name
+                shutil.copy2(label_src, label_dst)
+                self._undo_stack.append(UndoRecord(OpType.COPY, str(label_dst), dst_dir, batch_id))
         return True
 
-    def move_image(self, src: str, dst_dir: str, batch_id: int = 0) -> bool:
+    def move_image(
+        self, src: str, dst_dir: str, batch_id: int = 0,
+        sync_label: bool = False, label_dir: str = ""
+    ) -> bool:
         src_path = Path(src)
         if not src_path.exists():
             return False
@@ -49,6 +61,12 @@ class FileOpsModel:
         dst_path = dst_dir_path / src_path.name
         shutil.move(src, dst_path)
         self._undo_stack.append(UndoRecord(OpType.MOVE, str(dst_path), str(src_path.parent), batch_id))
+        if sync_label and label_dir:
+            label_src = self.get_label_path(src, label_dir)
+            if label_src:
+                label_dst = dst_dir_path / Path(label_src).name
+                shutil.move(label_src, label_dst)
+                self._undo_stack.append(UndoRecord(OpType.MOVE, str(label_dst), str(Path(label_src).parent), batch_id))
         return True
 
     def undo(self) -> UndoRecord | None:
@@ -107,4 +125,12 @@ class FileOpsModel:
                 with open(txt_path, "r", encoding="utf-8") as f:
                     if image_path in {line.strip() for line in f if line.strip()}:
                         marks.add(cat)
+
+    @staticmethod
+    def get_label_path(image_path: str, label_dir: str) -> str | None:
+        if not label_dir:
+            return None
+        img_name = Path(image_path).stem
+        label_path = Path(label_dir) / f"{img_name}.txt"
+        return str(label_path) if label_path.exists() else None
         return marks

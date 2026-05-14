@@ -7,6 +7,8 @@ from PyQt6.QtCore import Qt, QPointF, QRectF
 from PyQt6.QtGui import QPixmap, QWheelEvent, QMouseEvent, QPainter
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 
+from src.views.label_overlay import LabelOverlay
+
 ZOOM_FACTOR = 1.25
 MIN_ZOOM = 0.05
 MAX_ZOOM = 50.0
@@ -18,11 +20,15 @@ class ImageViewer(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
 
+        self._label_overlay = LabelOverlay()
+        self._scene.addItem(self._label_overlay)
+
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._zoom_level: float = 1.0
         self._is_dragging: bool = False
         self._last_mouse_pos: QPointF = QPointF()
         self._image_path: str = ""
+        self._labels_visible: bool = True
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -60,6 +66,8 @@ class ImageViewer(QGraphicsView):
 
         self._pixmap_item = QGraphicsPixmapItem(pixmap)
         self._scene.addItem(self._pixmap_item)
+        self._label_overlay = LabelOverlay()
+        self._scene.addItem(self._label_overlay)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.fit_to_window()
         return width, height
@@ -72,6 +80,22 @@ class ImageViewer(QGraphicsView):
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         transform = self.transform()
         self._zoom_level = transform.m11()
+
+    def set_labels(
+        self,
+        labels: "list[YoloBbox]",
+        img_w: int,
+        img_h: int,
+    ) -> None:
+        if not self._labels_visible:
+            self._label_overlay.clear()
+            return
+        self._label_overlay.set_labels(labels, img_w, img_h)
+
+    def set_labels_visible(self, visible: bool) -> None:
+        self._labels_visible = visible
+        if not visible:
+            self._label_overlay.clear()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if not self._pixmap_item:

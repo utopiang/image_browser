@@ -38,6 +38,9 @@ class StatusBar(QStatusBar):
         nav_layout.addWidget(self._nav_total)
 
         self._label_filename = QLabel("文件名: -")
+        self._label_filename.setMinimumWidth(60)
+        self._label_filename.setMaximumWidth(200)
+        self._label_filename.setStyleSheet("padding: 0 8px; qproperty-textElideMode: Qt::ElideMiddle;")
         self._label_size = QLabel("尺寸: -")
         self._label_filesize = QLabel("大小: -")
         self._label_zoom = QLabel("缩放: -%")
@@ -87,4 +90,5 @@ class StatusBar(QStatusBar):
         self._label_zoom.setText(f"缩放: {zoom * 100:.0f}%")
         marks_str = ", ".join(sorted(marks)) if marks else "-"
         self._label_marks.setText(f"标记: {marks_str}")
+        self._label_filename.setToolTip(filename if filename != "-" else "")
         self.set_nav_info(current, total)

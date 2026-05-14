@@ -4,7 +4,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QProgressBar, QTextEdit, QFileDialog,
-    QComboBox,
+    QComboBox, QCheckBox,
 )
 
 
@@ -21,6 +21,8 @@ class BatchWorker(QThread):
         dst_dir: str,
         op_type: str,
         batch_id: int = 0,
+        sync_label: bool = True,
+        label_dir: str = "",
     ) -> None:
         super().__init__()
         self._file_ops = file_ops
@@ -28,6 +30,8 @@ class BatchWorker(QThread):
         self._dst_dir = dst_dir
         self._op_type = op_type
         self._batch_id = batch_id
+        self._sync_label = sync_label
+        self._label_dir = label_dir
 
     def run(self) -> None:
         success, fail = 0, 0
@@ -35,9 +39,11 @@ class BatchWorker(QThread):
         for i, path in enumerate(self._file_list):
             try:
                 if self._op_type == "copy":
-                    self._file_ops.copy_image(path, self._dst_dir, self._batch_id)
+                    self._file_ops.copy_image(path, self._dst_dir, self._batch_id,
+                                             sync_label=self._sync_label, label_dir=self._label_dir)
                 else:
-                    self._file_ops.move_image(path, self._dst_dir, self._batch_id)
+                    self._file_ops.move_image(path, self._dst_dir, self._batch_id,
+                                             sync_label=self._sync_label, label_dir=self._label_dir)
                 success += 1
                 last_path = path
             except Exception as e:
@@ -52,10 +58,11 @@ class BatchDialog(QDialog):
     finished = pyqtSignal(int, int)
     batch_completed = pyqtSignal(str, int, str)
 
-    def __init__(self, file_ops, batch_id: int = 0, parent=None) -> None:
+    def __init__(self, file_ops, batch_id: int = 0, label_dir: str = "", parent=None) -> None:
         super().__init__(parent)
         self._file_ops = file_ops
         self._batch_id = batch_id
+        self._label_dir = label_dir
         self._worker: BatchWorker | None = None
         self._setup_ui()
 
@@ -93,6 +100,10 @@ class BatchDialog(QDialog):
         self._btn_exec.clicked.connect(self._start_batch)
         self._btn_exec.setEnabled(False)
         layout.addWidget(self._btn_exec)
+
+        self._cb_sync_label = QCheckBox("同步处理标签文件")
+        self._cb_sync_label.setChecked(True)
+        layout.addWidget(self._cb_sync_label)
 
         self._progress = QProgressBar()
         layout.addWidget(self._progress)
@@ -133,7 +144,9 @@ class BatchDialog(QDialog):
 
         op_type = "copy" if self._op_combo.currentText() == "复制" else "move"
         self._worker = BatchWorker(
-            self._file_ops, paths, self._dst_dir, op_type, self._batch_id
+            self._file_ops, paths, self._dst_dir, op_type, self._batch_id,
+            sync_label=self._cb_sync_label.isChecked(),
+            label_dir=self._label_dir if self._cb_sync_label.isChecked() else "",
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log.connect(self._log.append)

@@ -17,6 +17,10 @@ class AppConfig:
     recursive: bool = False
     window_width: int = 1200
     window_height: int = 800
+    label_dir: str = ""
+    classes_file: str = ""
+    label_type: str = "detect"
+    label_visible: bool = True
 
 
 def load_config() -> AppConfig:
@@ -25,7 +29,12 @@ def load_config() -> AppConfig:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return AppConfig(**{k: v for k, v in data.items() if k in AppConfig.__dataclass_fields__})
+        known_fields = set(AppConfig.__dataclass_fields__)
+        config = AppConfig()
+        for k, v in data.items():
+            if k in known_fields:
+                setattr(config, k, v)
+        return config
     except (json.JSONDecodeError, TypeError):
         return AppConfig()
 
@@ -40,6 +49,10 @@ def save_config(config: AppConfig) -> None:
         "recursive": config.recursive,
         "window_width": config.window_width,
         "window_height": config.window_height,
+        "label_dir": config.label_dir,
+        "classes_file": config.classes_file,
+        "label_type": config.label_type,
+        "label_visible": config.label_visible,
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

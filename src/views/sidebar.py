@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel,
     QFileDialog, QHBoxLayout, QInputDialog,
     QListWidget, QScrollArea, QMenu,
+    QGroupBox, QCheckBox,
 )
 
 
@@ -15,10 +16,13 @@ class SideBar(QWidget):
     undo_requested = pyqtSignal()
     batch_requested = pyqtSignal()
     categories_changed = pyqtSignal(list)
+    class_filter_changed = pyqtSignal(set)
 
     def __init__(self, categories: list[str]) -> None:
         super().__init__()
         self._categories: list[str] = []
+        self._classes: list[str] = []
+        self._class_checkboxes: list[QCheckBox] = []
         self._target_dirs: list[str] = []
         self._mark_buttons: dict[str, QPushButton] = {}
         self._mark_layout: QVBoxLayout
@@ -92,6 +96,51 @@ class SideBar(QWidget):
         self.setMaximumWidth(240)
 
         self._rebuild_mark_buttons()
+        self._setup_class_filter()
+
+    def _setup_class_filter(self) -> None:
+        main_layout: QVBoxLayout = self.layout()
+        class_group = QGroupBox("类别过滤")
+        class_layout = QVBoxLayout(class_group)
+
+        self._class_scroll = QScrollArea()
+        self._class_scroll.setWidgetResizable(True)
+        self._class_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._class_widget = QWidget()
+        self._class_layout = QVBoxLayout(self._class_widget)
+        self._class_scroll.setWidget(self._class_widget)
+        class_layout.addWidget(self._class_scroll)
+
+        main_layout.insertWidget(main_layout.count() - 2, class_group)
+
+    def set_classes(self, classes: list[str]) -> None:
+        self._classes = list(classes)
+        while self._class_layout.count():
+            item = self._class_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._class_checkboxes.clear()
+        for cls in classes:
+            cb = QCheckBox(cls)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._on_class_toggled)
+            self._class_checkboxes.append(cb)
+            self._class_layout.addWidget(cb)
+
+    def _on_class_toggled(self) -> None:
+        active = self.get_active_classes()
+        self.class_filter_changed.emit(active)
+
+    def get_active_classes(self) -> set[int]:
+        active = set()
+        for i, cb in enumerate(self._class_checkboxes):
+            if cb.isChecked():
+                active.add(i)
+        return active
+
+    def set_active_classes(self, active: set[int]) -> None:
+        for i, cb in enumerate(self._class_checkboxes):
+            cb.setChecked(i in active)
 
     def _rebuild_mark_buttons(self) -> None:
         while self._mark_layout.count():

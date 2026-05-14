@@ -39,6 +39,8 @@ class MainWindow(QMainWindow):
             self.toolbar.prev_clicked.emit()
         elif key == Qt.Key.Key_F:
             self.toolbar.fit_clicked.emit()
+        elif key == Qt.Key.Key_T:
+            self.toolbar.toggle_labels_clicked.emit()
         elif key == Qt.Key.Key_Z and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.sidebar.undo_requested.emit()
         else:
