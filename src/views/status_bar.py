@@ -2,9 +2,29 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QStatusBar, QLabel, QWidget, QHBoxLayout,
-    QSlider, QLineEdit,
+    QApplication, QStatusBar, QLabel, QWidget, QHBoxLayout,
+    QSlider, QLineEdit, QMenu,
 )
+
+
+class CopyableLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.setStyleSheet("padding: 0 8px;")
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        copy_action = menu.addAction("复制")
+        menu.setStyleSheet("QMenu { menu-scrollable: 1; }")
+        action = menu.exec(event.globalPos())
+        if action == copy_action:
+            cb = QApplication.clipboard()
+            text = self.selectedText() or self.text()
+            text = text.replace("文件名: ", "", 1)
+            cb.setText(text)
 
 
 class StatusBar(QStatusBar):
@@ -37,10 +57,9 @@ class StatusBar(QStatusBar):
         nav_layout.addWidget(self._nav_label)
         nav_layout.addWidget(self._nav_total)
 
-        self._label_filename = QLabel("文件名: -")
+        self._label_filename = CopyableLabel("文件名: -")
         self._label_filename.setMinimumWidth(60)
         self._label_filename.setMaximumWidth(200)
-        self._label_filename.setStyleSheet("padding: 0 8px; qproperty-textElideMode: Qt::ElideMiddle;")
         self._label_size = QLabel("尺寸: -")
         self._label_filesize = QLabel("大小: -")
         self._label_zoom = QLabel("缩放: -%")

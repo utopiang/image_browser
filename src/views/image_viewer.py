@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from PyQt6.QtCore import Qt, QPointF, QRectF
 from PyQt6.QtGui import QPixmap, QWheelEvent, QMouseEvent, QPainter
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
@@ -57,8 +57,11 @@ class ImageViewer(QGraphicsView):
         if not Path(file_path).exists():
             return 0, 0
 
-        pil_img = Image.open(file_path)
-        width, height = pil_img.size
+        try:
+            pil_img = Image.open(file_path)
+            width, height = pil_img.size
+        except (UnidentifiedImageError, Exception):
+            return 0, 0
 
         pixmap = QPixmap(file_path)
         if pixmap.isNull():
