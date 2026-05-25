@@ -1,13 +1,4 @@
-import sys
-
-from PyQt6.QtWidgets import QApplication
-from src.app import App
-
-
-def main() -> None:
-    qt_app = QApplication(sys.argv)
-    app = App(qt_app)
-    sys.exit(app.run())
+from src.tk_app import main
 
 
 if __name__ == "__main__":

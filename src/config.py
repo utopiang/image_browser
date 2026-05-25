@@ -20,7 +20,7 @@ class AppConfig:
     label_dir: str = ""
     classes_file: str = ""
     label_type: str = "detect"
-    label_visible: bool = True
+    label_visible: bool = False
 
 
 def load_config() -> AppConfig:

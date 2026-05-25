@@ -1,2 +1,4 @@
-PyQt6>=6.6
 Pillow>=10.0
+opencv-python>=4.8
+imagehash>=4.3
+numpy>=1.24
