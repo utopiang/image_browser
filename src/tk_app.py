@@ -7,6 +7,10 @@ import shutil
 import threading
 import time
 from collections import defaultdict, OrderedDict
+
+VERSION = "v1.0.5"
+AUTHOR = "zhw"
+UPDATE_DATE = "2026-05-29"
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from functools import lru_cache
@@ -160,12 +164,29 @@ class LabelStore:
         self._coco_by_name: dict[str, list[LabelShape]] = {}
         self._label_cache: OrderedDict[str, list[LabelShape]] = OrderedDict()
         self._label_cache_max = 50
+        self._label_index: dict[str, list[Path]] = {}
 
     def configure(self, label_format: str, yolo_type: str, label_dir: str, detect_box_format: str = "xywh") -> None:
         self.format = label_format
         self.yolo_type = yolo_type
         self.label_dir = label_dir
         self.detect_box_format = detect_box_format
+        self._rebuild_label_index()
+
+    def _rebuild_label_index(self) -> None:
+        self._label_index.clear()
+        if not self.label_dir or self.format == "coco":
+            return
+        root = Path(self.label_dir)
+        if not root.exists():
+            return
+        suffix = ".json" if self.format == "labelme" else ".txt"
+        try:
+            for p in root.rglob(f"*{suffix}"):
+                if p.is_file():
+                    self._label_index.setdefault(p.stem, []).append(p)
+        except OSError:
+            pass
 
     def load_classes(self, path: str) -> list[str]:
         self.classes_file = path
@@ -193,6 +214,7 @@ class LabelStore:
 
     def clear_label_cache(self) -> None:
         self._label_cache.clear()
+        self._rebuild_label_index()
 
     def load_for_image(self, image_path: str, image_size: tuple[int, int]) -> list[LabelShape]:
         if image_path in self._label_cache:
@@ -307,9 +329,17 @@ class LabelStore:
     def _label_candidates(self, image_path: str, suffix: str) -> list[Path]:
         img = Path(image_path)
         candidates: list[Path] = []
+        # 优先从子目录索引中查找
+        indexed = self._label_index.get(img.stem, [])
+        for p in indexed:
+            if p.suffix.lower() == suffix.lower():
+                candidates.append(p)
+        # 回退到根目录默认位置
         if self.label_dir:
-            candidates.append(Path(self.label_dir) / f"{img.stem}{suffix}")
-        return list(dict.fromkeys(candidates))
+            default = Path(self.label_dir) / f"{img.stem}{suffix}"
+            if default not in candidates:
+                candidates.append(default)
+        return candidates
 
     def _load_labelme(self, image_path: str, image_size: tuple[int, int]) -> list[LabelShape]:
         p = next((path for path in self._label_candidates(image_path, ".json") if path.exists()), None)
@@ -417,6 +447,192 @@ class LabelStore:
         x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
         y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
         return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+
+class HighPerformanceSlider(ttk.Frame):
+    def __init__(self, parent: tk.Widget, thumb_size: tuple[int, int] = (80, 60), **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        self.thumb_size = thumb_size
+        self._value = 0.0
+        self._max = 100.0
+        self._dragging = False
+        self._inertia_after_id: str | None = None
+        self._debounce_after_id: str | None = None
+        self._velocity = 0.0
+        self._last_x = 0
+        self._last_time = 0
+        self._touch_start_x = 0
+        self._thumb_images: dict[int, ImageTk.PhotoImage] = {}
+        self.callback: callable | None = None
+        self._thumb_cache: OrderedDict[int, str] = OrderedDict()
+        self._cache_max = 20
+
+        self.track = tk.Frame(self, bg="#e5e7eb", height=8, cursor="hand2")
+        self.track.pack(fill="x", pady=(20, 0))
+        self.track.pack_propagate(False)
+
+        self.thumb_container = tk.Frame(self, height=thumb_size[1] + 10)
+        self.thumb_container.pack(fill="x")
+        self.thumb_container.pack_propagate(False)
+
+        self.slider_canvas = tk.Canvas(
+            self.thumb_container,
+            height=thumb_size[1] + 10,
+            bg="#f6f7f9",
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.slider_canvas.pack(fill="x")
+        self.slider_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.slider_canvas.bind("<ButtonPress-1>", self._on_press)
+        self.slider_canvas.bind("<B1-Motion>", self._on_drag)
+        self.slider_canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.slider_canvas.bind("<Button-4>", lambda e: self._on_wheel(-1))
+        self.slider_canvas.bind("<Button-5>", lambda e: self._on_wheel(1))
+        self.slider_canvas.bind("<MouseWheel>", self._on_mousewheel)
+
+        self.progress_label = ttk.Label(self, text="0%", font=("Microsoft YaHei UI", 10, "bold"))
+        self.progress_label.pack(anchor="center", pady=(4, 0))
+
+        self.preview_label = ttk.Label(self, text="", font=("Microsoft YaHei UI", 8))
+        self.preview_label.pack(anchor="center", pady=(2, 0))
+
+        self._track_x = 0
+        self._thumb_width = 16
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self._track_x = self._thumb_width // 2
+        self._canvas_width = event.width
+        self._draw_slider()
+
+    def _draw_slider(self) -> None:
+        self.slider_canvas.delete("all")
+        if not hasattr(self, "_canvas_width"):
+            return
+        width = self._canvas_width
+        x = self._track_x
+        thumb_w = self._thumb_width
+        track_top = 4
+        track_bottom = 12
+
+        self.slider_canvas.create_rectangle(x, track_top, width - x, track_bottom, fill="#d1d5db", outline="")
+
+        ratio = max(0.0, min(1.0, self._value / max(self._max, 1.0)))
+        fill_width = int(x + (width - 2 * x) * ratio)
+        self.slider_canvas.create_rectangle(x, track_top, fill_width, track_bottom, fill="#2563eb", outline="")
+
+        thumb_x = x + (width - 2 * x) * ratio
+        self.slider_canvas.create_oval(
+            thumb_x - thumb_w // 2, track_top - 2,
+            thumb_x + thumb_w // 2, track_bottom + 2,
+            fill="#ffffff", outline="#2563eb", width=2
+        )
+
+        self.slider_canvas.create_text(
+            thumb_x, track_top - 12,
+            text=f"{int(ratio * 100)}%",
+            fill="#2563eb", font=("Microsoft YaHei UI", 9, "bold")
+        )
+
+    def _on_press(self, event: tk.Event) -> None:
+        self._dragging = True
+        self._velocity = 0.0
+        self._last_x = event.x
+        self._last_time = time.time()
+        if self._inertia_after_id:
+            self.after_cancel(self._inertia_after_id)
+            self._inertia_after_id = None
+        self._update_value_from_x(event.x)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if not self._dragging:
+            return
+        current_time = time.time()
+        dt = max(current_time - self._last_time, 0.001)
+        self._velocity = (event.x - self._last_x) / dt
+        self._last_x = event.x
+        self._last_time = current_time
+        self._debounce_update(event.x)
+
+    def _debounce_update(self, x: float) -> None:
+        if self._debounce_after_id:
+            self.after_cancel(self._debounce_after_id)
+        self._debounce_after_id = self.after(16, lambda: self._update_value_from_x(x))
+
+    def _on_release(self, event: tk.Event) -> None:
+        if not self._dragging:
+            return
+        self._dragging = False
+        self._apply_inertia()
+
+    def _apply_inertia(self) -> None:
+        if abs(self._velocity) < 10:
+            self._velocity = 0.0
+            return
+
+        def step() -> None:
+            if abs(self._velocity) < 10:
+                self._velocity = 0.0
+                return
+            ratio = max(0.0, min(1.0, self._value / max(self._max, 1.0)))
+            width = getattr(self, "_canvas_width", 800) - 2 * self._track_x
+            delta = self._velocity * 0.016 * width / 100
+            self._value = max(0, min(self._max, self._value + delta))
+            self._velocity *= 0.92
+            self._draw_slider()
+            if self.callback:
+                self.callback(int(self._value), self._max)
+            self._inertia_after_id = self.after(16, step)
+
+        self._inertia_after_id = self.after(16, step)
+
+    def _on_wheel(self, delta: int) -> None:
+        step = max(1, self._max / 100)
+        self._value = max(0, min(self._max, self._value + delta * step))
+        self._draw_slider()
+        if self.callback:
+            self.callback(int(self._value), self._max)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        delta = -1 * int(event.delta / 120)
+        self._on_wheel(delta)
+
+    def _update_value_from_x(self, x: float) -> None:
+        if not hasattr(self, "_canvas_width"):
+            return
+        width = self._canvas_width - 2 * self._track_x
+        ratio = max(0.0, min(1.0, (x - self._track_x) / width))
+        self._value = ratio * self._max
+        self._draw_slider()
+        if self.callback:
+            self.callback(int(self._value), self._max)
+
+    def set_range(self, min_val: float, max_val: float) -> None:
+        self._value = min_val
+        self._max = max(max_val, min_val + 1)
+        self._draw_slider()
+
+    def set_value(self, value: float) -> None:
+        self._value = max(0, min(self._max, value))
+        self._draw_slider()
+
+    def get_value(self) -> float:
+        return self._value
+
+    def set_thumbnail(self, index: int, image: Image.Image | None) -> None:
+        if image is None:
+            self._thumb_cache.pop(index, None)
+            return
+        thumb = image.copy()
+        thumb.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
+        self._thumb_cache[index] = str(index)
+        if len(self._thumb_cache) > self._cache_max:
+            self._thumb_cache.popitem(last=False)
+        self._thumb_images[index] = ImageTk.PhotoImage(thumb)
+        self._draw_thumbnails()
+
+    def _draw_thumbnails(self) -> None:
+        pass
 
 
 class ScrollFrame(ttk.Frame):
@@ -726,9 +942,15 @@ class VideoExtractTask:
         self._future: Future | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._stop_event = threading.Event()
+        self._is_paused = False
+        self._pause_event = threading.Event()
+        self._hovering = False
+        self._progress_detail = ""
+        self._advanced_expanded = False
 
-        self.frame = ttk.LabelFrame(parent, text=f"抽帧任务{task_id}")
-        self.frame.pack(fill="x", padx=5, pady=5)
+        self.frame = ttk.LabelFrame(parent, text=f"抽帧任务{task_id}", padding=(6, 4))
+        self.frame.pack(fill="x", padx=4, pady=4)
+        self.frame.configure(style="CompactTask.TLabelframe")
 
         self.video_dir_var = StringVar()
         self.video_out_var = StringVar()
@@ -736,35 +958,118 @@ class VideoExtractTask:
         self.interval_value_var = DoubleVar(value=1.0)
         self.png_compress_var = IntVar(value=3)
         self.status_var = StringVar(value="就绪")
+        self._progress_int = 0
 
-        row1 = ttk.Frame(self.frame)
-        row1.pack(fill="x", padx=5, pady=2)
-        ttk.Button(row1, text="视频文件夹", command=self._choose_video_dir).pack(side="left")
-        ttk.Label(row1, textvariable=self.video_dir_var, wraplength=300).pack(side="left", padx=(5, 0))
+        main = ttk.Frame(self.frame)
+        main.pack(fill="x")
 
-        row2 = ttk.Frame(self.frame)
-        row2.pack(fill="x", padx=5, pady=2)
-        ttk.Button(row2, text="输出文件夹", command=self._choose_out_dir).pack(side="left")
-        ttk.Label(row2, textvariable=self.video_out_var, wraplength=300).pack(side="left", padx=(5, 0))
+        header = ttk.Frame(main)
+        header.pack(fill="x", pady=(0, 2))
+        ttk.Label(header, text=f"#{task_id}", font=("Microsoft YaHei UI", 9, "bold"), foreground="#3b82f6").pack(side="left")
+        self.status_indicator = tk.Frame(header, width=8, height=8, bg="#22c55e")
+        self.status_indicator.pack(side="left", padx=(6, 0))
+        self.status_indicator_proc = self.status_indicator
+        ttk.Label(header, textvariable=self.status_var, font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(side="left", padx=(6, 0))
 
-        row3 = ttk.Frame(self.frame)
-        row3.pack(fill="x", padx=5, pady=2)
-        ttk.Label(row3, text="间隔模式:").pack(side="left")
-        ttk.Combobox(row3, values=["seconds", "frames"], textvariable=self.interval_mode_var, state="readonly", width=8).pack(side="left", padx=5)
-        ttk.Label(row3, text="数值:").pack(side="left")
-        ttk.Spinbox(row3, from_=0.1, to=10000, increment=0.5, textvariable=self.interval_value_var, width=8).pack(side="left")
-        ttk.Label(row3, text="压缩:").pack(side="left", padx=(10, 0))
-        ttk.Spinbox(row3, from_=0, to=9, textvariable=self.png_compress_var, width=4).pack(side="left")
+        param_row = ttk.Frame(main)
+        param_row.pack(fill="x", pady=(0, 2))
+        ttk.Button(param_row, text="视频", command=self._choose_video_dir, width=5, style="Compact.TButton").pack(side="left")
+        self._video_dir_label = ttk.Label(param_row, text="未选择", font=("Microsoft YaHei UI", 7), foreground="#64748b", width=12, cursor="hand1")
+        self._video_dir_label.pack(side="left", padx=(2, 0), fill="x", expand=True)
+        self._video_dir_label.bind("<Enter>", lambda e: self._show_path_tooltip(e, self.video_dir_var))
+        self._video_dir_label.bind("<Leave>", lambda _: self._hide_tooltip())
 
-        row4 = ttk.Frame(self.frame)
-        row4.pack(fill="x", padx=5, pady=2)
-        self.start_btn = ttk.Button(row4, text="开始", command=self._start)
+        ttk.Button(param_row, text="输出", command=self._choose_out_dir, width=5, style="Compact.TButton").pack(side="left", padx=(4, 0))
+        self._out_dir_label = ttk.Label(param_row, text="未选择", font=("Microsoft YaHei UI", 7), foreground="#64748b", width=12, cursor="hand1")
+        self._out_dir_label.pack(side="left", padx=(2, 0), fill="x", expand=True)
+        self._out_dir_label.bind("<Enter>", lambda e: self._show_path_tooltip(e, self.video_out_var))
+        self._out_dir_label.bind("<Leave>", lambda _: self._hide_tooltip())
+
+        self._expand_btn = ttk.Button(param_row, text="...", command=self._toggle_advanced, width=2, style="Compact.TButton")
+        self._expand_btn.pack(side="right")
+
+        param_row2 = ttk.Frame(main)
+        param_row2.pack(fill="x", pady=(0, 2))
+        ttk.Label(param_row2, text="间隔", font=("Microsoft YaHei UI", 7)).pack(side="left")
+        ttk.Combobox(param_row2, values=["秒", "帧"], textvariable=self.interval_mode_var, state="readonly", width=4).pack(side="left", padx=2)
+        ttk.Spinbox(param_row2, from_=0.1, to=10000, increment=0.5, textvariable=self.interval_value_var, width=5).pack(side="left")
+
+        ttk.Label(param_row2, text="压缩", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(8, 0))
+        ttk.Spinbox(param_row2, from_=0, to=9, textvariable=self.png_compress_var, width=2).pack(side="left", padx=2)
+
+        btn_row = ttk.Frame(main)
+        btn_row.pack(fill="x", pady=(2, 0))
+        self.start_btn = ttk.Button(btn_row, text="开始", command=self._start, width=6, style="Action.TButton")
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(row4, text="停止抽帧", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(6, 0))
-        self.delete_btn = ttk.Button(row4, text="删除", command=lambda: self.delete_callback(self.task_id), width=6)
-        self.delete_btn.pack(side="left", padx=(6, 0))
-        ttk.Label(row4, textvariable=self.status_var, wraplength=350, style="Info.TLabel").pack(side="left", padx=(10, 0))
+        self.pause_btn = ttk.Button(btn_row, text="暂停", command=self._pause, state="disabled", width=5)
+        self.pause_btn.pack(side="left", padx=2)
+        self.stop_btn = ttk.Button(btn_row, text="停止", command=self._stop, state="disabled", width=5)
+        self.stop_btn.pack(side="left", padx=2)
+        self.delete_btn = ttk.Button(btn_row, text="删除", command=lambda: self.delete_callback(self.task_id), width=5, style="Danger.TButton")
+        self.delete_btn.pack(side="right")
+
+        self.progress_bar = ttk.Progressbar(main, maximum=100, mode="determinate")
+        self.progress_bar.pack(fill="x", pady=(4, 0))
+
+        progress_info = ttk.Frame(main)
+        progress_info.pack(fill="x", pady=(2, 0))
+        self.progress_pct_var = StringVar(value="0%")
+        ttk.Label(progress_info, textvariable=self.progress_pct_var, font=("Microsoft YaHei UI", 8, "bold"), width=5).pack(side="left")
+        self.progress_detail_var = StringVar(value="")
+        self._progress_detail_label = ttk.Label(progress_info, textvariable=self.progress_detail_var, font=("Microsoft YaHei UI", 7), foreground="#64748b")
+        self._progress_detail_label.pack(side="left", padx=(4, 0), fill="x", expand=True)
+        self.status_short_var = StringVar(value="就绪")
+        self._status_short_label = ttk.Label(progress_info, textvariable=self.status_short_var, font=("Microsoft YaHei UI", 7), foreground="#64748b", anchor="e")
+        self._status_short_label.pack(side="right")
+
+        self._advanced_frame: ttk.Frame | None = None
+        self._tooltip: tk.Toplevel | None = None
+
+    def _show_path_tooltip(self, event: tk.Event, var: StringVar) -> None:
+        path = var.get()
+        if not path:
+            return
+        if self._tooltip:
+            self._tooltip.destroy()
+        win = tk.Toplevel(self.frame)
+        win.wm_overrideredirect(True)
+        win.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+        win.attributes("-topmost", True)
+        tk.Label(win, text=path, bg="#1f2937", fg="#ffffff", font=("Microsoft YaHei UI", 8), wraplength=300).pack(padx=6, pady=4)
+        self._tooltip = win
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip:
+            self._tooltip.destroy()
+            self._tooltip = None
+
+    def _toggle_advanced(self) -> None:
+        if self._advanced_expanded:
+            if self._advanced_frame:
+                self._advanced_frame.pack_forget()
+            self._expand_btn.configure(text="...")
+            self._advanced_expanded = False
+        else:
+            if not self._advanced_frame:
+                self._advanced_frame = ttk.Frame(self.frame)
+                ttk.Label(self._advanced_frame, text="高级设置面板", font=("Microsoft YaHei UI", 8, "bold")).pack(anchor="w", pady=(0, 4))
+            self._advanced_frame.pack(fill="x", padx=4, pady=(4, 0))
+            self._expand_btn.configure(text="∧")
+            self._advanced_expanded = True
+
+    def _update_progress(self, progress: float | None) -> None:
+        if progress is not None:
+            self._progress_int = max(0, min(100, int(progress)))
+            self.progress_bar["value"] = self._progress_int
+            self.progress_pct_var.set(f"{self._progress_int}%")
+            if self._progress_int >= 100:
+                self.status_indicator_proc.configure(bg="#22c55e")
+            elif self._progress_int > 0:
+                self.status_indicator_proc.configure(bg="#f59e0b")
+        path = self.video_dir_var.get()
+        self._video_dir_label.configure(text=Path(path).name if path else "未选择", foreground="#1f2937" if path else "#94a3b8")
+        path = self.video_out_var.get()
+        self._out_dir_label.configure(text=Path(path).name if path else "未选择", foreground="#1f2937" if path else "#94a3b8")
 
     def _choose_video_dir(self) -> None:
         path = filedialog.askdirectory()
@@ -797,17 +1102,40 @@ class VideoExtractTask:
 
         self.running = True
         self._stop_event.clear()
+        self._is_paused = False
+        self._pause_event.clear()
         self.start_btn.config(state="disabled")
+        self.pause_btn.config(state="normal", text="暂停")
         self.stop_btn.config(state="normal")
+        self.status_indicator_proc.configure(bg="#3b82f6")
         self._emit("处理中...", 0)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._future = self._executor.submit(self._worker, video_dir, out_dir)
+
+    def _pause(self) -> None:
+        if not self.running:
+            return
+        if self._is_paused:
+            self._is_paused = False
+            self._pause_event.clear()
+            self.pause_btn.config(text="暂停")
+            self.status_indicator_proc.configure(bg="#3b82f6")
+            self._emit("继续处理...", None)
+        else:
+            self._is_paused = True
+            self._pause_event.set()
+            self.pause_btn.config(text="继续")
+            self.status_indicator_proc.configure(bg="#f59e0b")
+            self._emit("已暂停", None)
 
     def _stop(self) -> None:
         if not self.running:
             return
         self._stop_event.set()
+        self._is_paused = False
         self.stop_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="暂停")
+        self.status_indicator_proc.configure(bg="#ef4444")
         self._emit("正在停止抽帧...", None)
 
     def _worker(self, video_dir: str, out_dir: str) -> None:
@@ -835,11 +1163,16 @@ class VideoExtractTask:
                 if self._stop_event.is_set():
                     self._emit(f"[已停止] 已处理 {idx - 1}/{total} 个视频，共 {frames_total} 张图片", (idx - 1) / max(total, 1) * 100)
                     return
+                if self._is_paused:
+                    self._pause_event.wait()
+                    if self._stop_event.is_set():
+                        return
                 base_progress = (idx - 1) / max(total, 1) * 100
                 span = 100 / max(total, 1)
                 count = self._extract_single(video, root, out_dir, interval_mode, interval_value, compress, base_progress, span)
                 frames_total += count
-                self._emit(f"[{idx}/{total}] {video.name} 完成 ({count}张)", idx / max(total, 1) * 100)
+                current_pct = idx / max(total, 1) * 100
+                self._emit(f"[{idx}/{total}] {video.name} 完成 ({count}张)", current_pct)
 
             self._emit(f"[完成] {total}个视频 {frames_total}张图片", 100)
 
@@ -849,6 +1182,7 @@ class VideoExtractTask:
             with VideoExtractTask._worker_lock:
                 VideoExtractTask._active_workers -= 1
             self.running = False
+            self._is_paused = False
             self.parent.after(0, self._finish_ui)
             if self._executor:
                 self._executor.shutdown(wait=False)
@@ -856,9 +1190,15 @@ class VideoExtractTask:
 
     def _finish_ui(self) -> None:
         self.start_btn.config(state="normal")
+        self.pause_btn.config(state="disabled", text="暂停")
         self.stop_btn.config(state="disabled")
 
     def _emit(self, msg: str, progress: float | None = None) -> None:
+        self._update_progress(progress)
+        self.status_var.set(msg)
+        self.status_short_var.set(msg[:20] + "..." if len(msg) > 20 else msg)
+        if progress is not None:
+            self.progress_detail_var.set(f"{int(progress)}%")
         self.parent.after(0, lambda: self.callback(self.task_id, msg, progress))
 
     def _performance_enabled(self) -> bool:
@@ -985,9 +1325,16 @@ class SimilarDedupeTask:
         self.stop_callback = stop_callback
         self.delete_callback = delete_callback
         self.running = False
+        self._is_paused = False
+        self._pause_event = threading.Event()
+        self._progress_precision = 0.1
+        self._buffer_path: Path | None = None
+        self._buffer_save_interval = 30
+        self._last_save_time = 0
+        self._gpu_expanded = False
 
-        self.frame = ttk.LabelFrame(parent, text=f"相似去重任务{task_id}", padding=(8, 6))
-        self.frame.pack(fill="x", padx=2, pady=(0, 8))
+        self.frame = ttk.LabelFrame(parent, text=f"相似去重任务{task_id}", padding=(6, 4))
+        self.frame.pack(fill="x", padx=2, pady=(0, 6))
 
         self.dir_var = StringVar()
         self.phash_var = IntVar(value=9)
@@ -995,40 +1342,184 @@ class SimilarDedupeTask:
         self.algorithm_label_var = StringVar(value="pHash/颜色")
         self.status_var = StringVar(value="就绪")
         self.progress_var = DoubleVar(value=0)
+        self._progress_detail = StringVar(value="")
 
-        row1 = ttk.Frame(self.frame)
-        row1.pack(fill="x", pady=(0, 6))
-        ttk.Button(row1, text="图片文件夹", command=self._choose_dir).pack(side="left")
-        ttk.Label(row1, textvariable=self.dir_var, wraplength=300, anchor="w", justify="left").pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._color_weight = DoubleVar(value=0.40)
+        self._texture_weight = DoubleVar(value=0.30)
+        self._shape_weight = DoubleVar(value=0.30)
+        self._similarity_threshold = IntVar(value=75)
+        self._precision_mode = StringVar(value="balanced")
 
-        row2 = ttk.Frame(self.frame)
-        row2.pack(fill="x", pady=(0, 6))
-        self.phash_label = ttk.Label(row2, text="pHash")
-        self.phash_label.pack(side="left")
-        self.phash_spinbox = ttk.Spinbox(row2, from_=0, to=64, textvariable=self.phash_var, width=6)
-        self.phash_spinbox.pack(side="left", padx=(5, 12))
-        self.color_label = ttk.Label(row2, text="颜色相似")
-        self.color_label.pack(side="left")
-        self.color_spinbox = ttk.Spinbox(row2, from_=0, to=1, increment=0.05, textvariable=self.color_var, width=6)
-        self.color_spinbox.pack(side="left", padx=5)
-        self.color_hint_label = ttk.Label(row2, text="(值越大找出越多相似图片)", style="Hint.TLabel")
-        self.color_hint_label.pack(side="left", padx=(2, 0))
+        header = ttk.Frame(self.frame)
+        header.pack(fill="x", pady=(0, 2))
+        ttk.Label(header, text=f"#{task_id}", font=("Microsoft YaHei UI", 9, "bold"), foreground="#ef4444").pack(side="left")
+        self.status_indicator = tk.Frame(header, width=8, height=8, bg="#22c55e")
+        self.status_indicator.pack(side="left", padx=(6, 0))
+        ttk.Label(header, textvariable=self.status_var, font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(side="left", padx=(6, 0))
+        self._dir_label = ttk.Label(header, text="未选择", font=("Microsoft YaHei UI", 7), foreground="#64748b", cursor="hand1")
+        self._dir_label.pack(side="left", padx=(6, 0))
+        self._dir_label.bind("<Enter>", lambda e: self._show_dir_tooltip(e))
+        self._dir_label.bind("<Leave>", lambda _: self._hide_tooltip())
 
-        row3 = ttk.Frame(self.frame)
-        row3.pack(fill="x", pady=(0, 6))
-        self.start_btn = ttk.Button(row3, text="扫描", command=self._start, width=6)
+        param_row = ttk.Frame(self.frame)
+        param_row.pack(fill="x", pady=(0, 2))
+        ttk.Button(param_row, text="文件夹", command=self._choose_dir, width=6, style="Compact.TButton").pack(side="left")
+        ttk.Label(param_row, text="pHash", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(8, 0))
+        self.phash_spinbox = ttk.Spinbox(param_row, from_=0, to=64, textvariable=self.phash_var, width=3)
+        self.phash_spinbox.pack(side="left", padx=2)
+        ttk.Label(param_row, text="颜色", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(8, 0))
+        self.color_spinbox = ttk.Spinbox(param_row, from_=0, to=1, increment=0.05, textvariable=self.color_var, width=4)
+        self.color_spinbox.pack(side="left", padx=2)
+
+        self._expand_btn = ttk.Button(param_row, text="GPU+", command=self._toggle_gpu, width=5, style="Accent.TButton")
+        self._expand_btn.pack(side="right")
+
+        self._gpu_frame: ttk.LabelFrame | None = None
+        self._tooltip: tk.Toplevel | None = None
+
+        btn_row = ttk.Frame(self.frame)
+        btn_row.pack(fill="x", pady=(2, 0))
+        self.start_btn = ttk.Button(btn_row, text="扫描", command=self._start, width=6, style="Action.TButton")
         self.start_btn.pack(side="left")
-        self.view_btn = ttk.Button(row3, text="查看", command=lambda: self.view_callback(self.task_id), state="disabled", width=6)
-        self.view_btn.pack(side="left", padx=(5, 0))
-        self.stop_btn = ttk.Button(row3, text="停止", command=self._stop, state="disabled", width=6)
-        self.stop_btn.pack(side="left", padx=(5, 0))
-        self.delete_btn = ttk.Button(row3, text="删除", command=lambda: self.delete_callback(self.task_id), width=6)
-        self.delete_btn.pack(side="left", padx=(5, 0))
+        self.pause_btn = ttk.Button(btn_row, text="暂停", command=self._pause, state="disabled", width=5)
+        self.pause_btn.pack(side="left", padx=2)
+        self.view_btn = ttk.Button(btn_row, text="查看", command=lambda: self.view_callback(self.task_id), state="disabled", width=5)
+        self.view_btn.pack(side="left", padx=2)
+        self.stop_btn = ttk.Button(btn_row, text="停止", command=self._stop_with_confirm, state="disabled", width=5)
+        self.stop_btn.pack(side="left", padx=2)
+        self.delete_btn = ttk.Button(btn_row, text="删除", command=lambda: self.delete_callback(self.task_id), width=5, style="Danger.TButton")
+        self.delete_btn.pack(side="right")
 
-        row4 = ttk.Frame(self.frame)
-        row4.pack(fill="x")
-        ttk.Progressbar(row4, variable=self.progress_var, maximum=100).pack(fill="x")
-        ttk.Label(row4, textvariable=self.status_var, wraplength=320, style="Info.TLabel", anchor="w", justify="left").pack(fill="x", pady=(4, 0))
+        progress_row = ttk.Frame(self.frame)
+        progress_row.pack(fill="x", pady=(2, 0))
+        self.progress_bar = ttk.Progressbar(progress_row, variable=self.progress_var, maximum=100, mode="determinate")
+        self.progress_bar.pack(fill="x")
+        progress_info = ttk.Frame(progress_row)
+        progress_info.pack(fill="x", pady=(2, 0))
+        self.progress_pct_var = StringVar(value="0.0%")
+        ttk.Label(progress_info, textvariable=self.progress_pct_var, font=("Microsoft YaHei UI", 8, "bold"), width=5).pack(side="left")
+        ttk.Label(progress_info, textvariable=self._progress_detail, font=("Microsoft YaHei UI", 7), foreground="#64748b").pack(side="left", padx=(4, 0))
+
+        self._init_buffer_path()
+
+    def _show_dir_tooltip(self, event: tk.Event) -> None:
+        path = self.dir_var.get()
+        if not path:
+            return
+        if self._tooltip:
+            self._tooltip.destroy()
+        win = tk.Toplevel(self.frame)
+        win.wm_overrideredirect(True)
+        win.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+        win.attributes("-topmost", True)
+        tk.Label(win, text=path, bg="#1f2937", fg="#ffffff", font=("Microsoft YaHei UI", 8), wraplength=300).pack(padx=6, pady=4)
+        self._tooltip = win
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip:
+            self._tooltip.destroy()
+            self._tooltip = None
+
+    def _toggle_gpu(self) -> None:
+        if self._gpu_expanded:
+            if self._gpu_frame:
+                self._gpu_frame.pack_forget()
+            self._expand_btn.configure(text="GPU+")
+            self._gpu_expanded = False
+        else:
+            if not self._gpu_frame:
+                self._gpu_frame = ttk.LabelFrame(self.frame, text="GPU多特征融合设置", padding=(6, 4))
+                ttk.Label(self._gpu_frame, text="相似度阈值", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+                threshold_row = ttk.Frame(self._gpu_frame)
+                threshold_row.pack(fill="x", pady=(2, 0))
+                ttk.Label(threshold_row, text="阈值:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+                ttk.Scale(threshold_row, from_=0, to=100, orient="horizontal", variable=self._similarity_threshold, length=100).pack(side="left", padx=2)
+                ttk.Label(threshold_row, textvariable=self._similarity_threshold, font=("Microsoft YaHei UI", 7, "bold"), width=3).pack(side="left")
+                ttk.Label(threshold_row, text="%", font=("Microsoft YaHei UI", 7)).pack(side="left")
+
+                weight_row = ttk.Frame(self._gpu_frame)
+                weight_row.pack(fill="x", pady=(4, 0))
+                ttk.Label(weight_row, text="颜色", font=("Microsoft YaHei UI", 7)).pack(side="left")
+                ttk.Scale(weight_row, from_=0, to=100, orient="horizontal", variable=self._color_weight, length=60).pack(side="left", padx=2)
+                ttk.Label(weight_row, textvariable=self._color_weight, font=("Microsoft YaHei UI", 7), width=4).pack(side="left")
+                ttk.Label(weight_row, text="纹理", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(6, 0))
+                ttk.Scale(weight_row, from_=0, to=100, orient="horizontal", variable=self._texture_weight, length=60).pack(side="left", padx=2)
+                ttk.Label(weight_row, textvariable=self._texture_weight, font=("Microsoft YaHei UI", 7), width=4).pack(side="left")
+                ttk.Label(weight_row, text="形状", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(6, 0))
+                ttk.Scale(weight_row, from_=0, to=100, orient="horizontal", variable=self._shape_weight, length=60).pack(side="left", padx=2)
+                ttk.Label(weight_row, textvariable=self._shape_weight, font=("Microsoft YaHei UI", 7), width=4).pack(side="left")
+
+                precision_row = ttk.Frame(self._gpu_frame)
+                precision_row.pack(fill="x", pady=(4, 0))
+                ttk.Label(precision_row, text="精度:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+                for mode, label in [("fast", "快速"), ("balanced", "平衡"), ("precise", "精确")]:
+                    ttk.Radiobutton(precision_row, text=label, variable=self._precision_mode, value=mode).pack(side="left", padx=(2, 0))
+                ttk.Button(precision_row, text="预览", command=self._show_preview, width=5).pack(side="right")
+
+                def _on_weight_changed(*_):
+                    total = self._color_weight.get() + self._texture_weight.get() + self._shape_weight.get()
+                    if abs(total - 1.0) > 0.01:
+                        self._color_weight.set(self._color_weight.get() / total)
+                        self._texture_weight.set(self._texture_weight.get() / total)
+                        self._shape_weight.set(self._shape_weight.get() / total)
+
+            self._gpu_frame.pack(fill="x", pady=(4, 0))
+            self._expand_btn.configure(text="GPU-")
+            self._gpu_expanded = True
+
+    def _init_buffer_path(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self._buffer_path = CONFIG_DIR / f"dedupe_task_{self.task_id}_buffer.webp"
+        except OSError:
+            pass
+
+    def _on_precision_changed(self) -> None:
+        mode = self._precision_mode.get()
+        if mode == "fast":
+            batch_size = 256
+            workers = 4
+        elif mode == "balanced":
+            batch_size = 128
+            workers = 6
+        else:
+            batch_size = 64
+            workers = 8
+        self._precision_detail = f"批次:{batch_size} 线程:{workers}"
+        self.update_status(f"精度模式: {mode}", None)
+
+    def _show_preview(self) -> None:
+        preview_window = tk.Toplevel(self.parent)
+        preview_window.title("相似度计算效果预览")
+        preview_window.geometry("600x400")
+        preview_window.transient(self.parent)
+        x = preview_window.winfo_screenwidth() // 2 - 300
+        y = preview_window.winfo_screenheight() // 2 - 200
+        preview_window.geometry(f"+{x}+{y}")
+
+        info_frame = ttk.Frame(preview_window)
+        info_frame.pack(fill="x", pady=(10, 5))
+        ttk.Label(info_frame, text=f"特征权重配置:", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=10)
+        ttk.Label(info_frame, text=f"  颜色权重: {self._color_weight.get():.2f}", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=20)
+        ttk.Label(info_frame, text=f"  纹理权重: {self._texture_weight.get():.2f}", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=20)
+        ttk.Label(info_frame, text=f"  形状权重: {self._shape_weight.get():.2f}", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=20)
+        ttk.Label(info_frame, text=f"  相似度阈值: {self._similarity_threshold.get()}%", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=20)
+        ttk.Label(info_frame, text=f"  计算精度: {self._precision_mode.get()}", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=20)
+
+        ttk.Label(preview_window, text="相似度计算公式:", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        formula = f"S = {self._color_weight.get():.2f}×S_color + {self._texture_weight.get():.2f}×S_texture + {self._shape_weight.get():.2f}×S_shape"
+        ttk.Label(preview_window, text=formula, font=("Consolas", 9), foreground="#3b82f6").pack(anchor="w", padx=20)
+
+        ttk.Label(preview_window, text="特征说明:", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        desc = tk.Text(preview_window, height=6, font=("Microsoft YaHei UI", 8), wrap="word")
+        desc.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        desc.insert("1.0", "颜色特征: 基于图像颜色直方图和RGB通道统计\n")
+        desc.insert("end", "纹理特征: 基于图像梯度方向统计(HOG-like)，反映边缘和纹理模式\n")
+        desc.insert("end", "形状特征: 基于图像归一化轮廓和边缘密度，反映目标形状相似度\n\n")
+        desc.insert("end", "加权融合: 根据配置的权重比例计算综合相似度，超过阈值则判定为相似")
+        desc.config(state="disabled")
+
+        ttk.Button(preview_window, text="关闭", command=preview_window.destroy).pack(pady=(0, 10))
 
     def _choose_dir(self) -> None:
         path = filedialog.askdirectory()
@@ -1044,22 +1535,146 @@ class SimilarDedupeTask:
             messagebox.showwarning("提示", "请选择扫描图片文件夹")
             return
         self.running = True
+        self._is_paused = False
+        self._pause_event.clear()
         self.start_btn.config(state="disabled")
+        self.pause_btn.config(state="normal", text="暂停")
         self.view_btn.config(state="disabled", text="查看")
         self.stop_btn.config(state="normal")
         self.delete_btn.config(state="disabled")
+        self.status_indicator.configure(bg="#3b82f6")
         self.update_status("扫描中...", 0)
+        self._last_save_time = time.time()
         phash = max(0, min(64, safe_int(self.phash_var.get(), 9)))
         color = max(0.0, min(1.0, safe_float(self.color_var.get(), 0.40)))
         algorithm = "gpu_features" if self.algorithm_label_var.get() == "GPU特征" else "phash"
         self.callback(self.task_id, folder, phash, color, algorithm)
 
+    def _pause(self) -> None:
+        if not self.running:
+            return
+        if self._is_paused:
+            self._is_paused = False
+            self._pause_event.clear()
+            self.pause_btn.config(text="暂停")
+            self.status_indicator.configure(bg="#3b82f6")
+            self.update_status("继续扫描...", None)
+        else:
+            self._is_paused = True
+            self._pause_event.set()
+            self.pause_btn.config(text="继续")
+            self.status_indicator.configure(bg="#f59e0b")
+            self.update_status("已暂停", None)
+
+    def _stop_with_confirm(self) -> None:
+        if not self.running:
+            return
+        dialog = tk.Toplevel(self.parent)
+        dialog.title("停止确认")
+        dialog.geometry("300x180")
+        dialog.resizable(False, False)
+        dialog.transient(self.parent)
+        dialog.grab_set()
+        x = dialog.winfo_screenwidth() // 2 - 150
+        y = dialog.winfo_screenheight() // 2 - 90
+        dialog.geometry(f"+{x}+{y}")
+
+        msg = ttk.Label(dialog, text=f"任务 #{self.task_id} 正在运行\n请选择停止方式：", font=("Microsoft YaHei UI", 10))
+        msg.pack(pady=(20, 10))
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        def do_pause():
+            dialog.destroy()
+            self._is_paused = True
+            self._pause_event.set()
+            self.pause_btn.config(state="disabled", text="继续")
+            self.stop_btn.config(state="normal")
+            self.status_indicator.configure(bg="#f59e0b")
+            self.update_status("已暂停，可恢复", None)
+            self._save_buffer()
+
+        def do_stop():
+            dialog.destroy()
+            self._is_paused = False
+            self.stop_callback(self.task_id)
+            self.stop_btn.config(state="disabled")
+            self.pause_btn.config(state="disabled", text="暂停")
+            self.status_indicator.configure(bg="#ef4444")
+            self.update_status("正在停止...", None)
+
+        ttk.Button(btn_frame, text="暂停（保存进度）", command=do_pause, width=14).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="直接停止", command=do_stop, width=12).pack(side="left", padx=4)
+
+        ttk.Label(dialog, text="暂停后可重新开始继续任务", font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(pady=(10, 0))
+
     def _stop(self) -> None:
         if not self.running:
             return
+        self._is_paused = False
         self.stop_callback(self.task_id)
         self.stop_btn.config(state="disabled")
-        self.update_status("停止中...")
+        self.pause_btn.config(state="disabled", text="暂停")
+        self.status_indicator.configure(bg="#ef4444")
+        self.update_status("正在停止...", None)
+
+    def _save_buffer(self) -> None:
+        if self._buffer_path is None:
+            return
+        try:
+            buffer_data = {
+                "task_id": self.task_id,
+                "folder": self.dir_var.get(),
+                "progress": self.progress_var.get(),
+                "phash": self.phash_var.get(),
+                "color": self.color_var.get(),
+                "algorithm": self.algorithm_label_var.get(),
+                "timestamp": time.time(),
+            }
+            with open(self._buffer_path, "w", encoding="utf-8") as f:
+                json.dump(buffer_data, f, ensure_ascii=False)
+            self._progress_detail.set(f"缓冲已保存: {self._buffer_path.name}")
+        except Exception as e:
+            self._progress_detail.set(f"缓冲保存失败: {e}")
+
+    def _load_buffer(self) -> dict | None:
+        if self._buffer_path is None or not self._buffer_path.exists():
+            return None
+        try:
+            with open(self._buffer_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def restore_from_buffer(self) -> bool:
+        data = self._load_buffer()
+        if not data:
+            return False
+        self.dir_var.set(data.get("folder", ""))
+        self.phash_var.set(data.get("phash", 9))
+        self.color_var.set(data.get("color", 0.40))
+        self.algorithm_label_var.set(data.get("algorithm", "pHash/颜色"))
+        self.progress_var.set(data.get("progress", 0))
+        self.progress_pct_var.set(f"{data.get('progress', 0):.1f}%")
+        return True
+
+    def update_status(self, msg: str, progress: float | None = None) -> None:
+        self.status_var.set(msg)
+        if progress is not None:
+            self.progress_var.set(max(0, min(100, progress)))
+            self.progress_pct_var.set(f"{progress:.1f}%")
+            self._progress_detail.set(f"精确度: {self._progress_precision}%")
+            current_time = time.time()
+            if current_time - self._last_save_time >= self._buffer_save_interval:
+                self._save_buffer()
+                self._last_save_time = current_time
+        if msg.startswith("[完成]"):
+            self.status_indicator.configure(bg="#22c55e")
+        elif msg.startswith("[错误]"):
+            self.status_indicator.configure(bg="#ef4444")
+        elif msg.startswith("[已停止]"):
+            self.status_indicator.configure(bg="#f59e0b")
 
     def set_view_state(self, available: bool, current: bool = False) -> None:
         if current:
@@ -1071,34 +1686,34 @@ class SimilarDedupeTask:
 
     def set_phash_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        self.phash_label.config(state=state)
         self.phash_spinbox.config(state=state)
-        if not enabled:
-            self.phash_label.config(text="pHash (GPU模式禁用)")
-        else:
-            self.phash_label.config(text="pHash")
+        if self._gpu_expanded and self._gpu_frame:
+            for child in self._gpu_frame.winfo_children():
+                if isinstance(child, ttk.Label):
+                    if not enabled:
+                        child.config(text="pHash (GPU模式禁用)")
+                    else:
+                        child.config(text="GPU多特征融合设置")
 
-    def update_status(self, msg: str, progress: float | None = None) -> None:
-        self.status_var.set(msg)
-        if progress is not None:
-            self.progress_var.set(progress)
-        if msg.startswith("[已停止]"):
-            self.running = False
-            self.start_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.delete_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.delete_btn.config(state="normal")
-            return
-        if msg.startswith("[完成]") or msg.startswith("[错误]"):
-            self.running = False
-            self.start_btn.config(state="normal")
+    def finish_task(self) -> None:
+        self.running = False
+        self._is_paused = False
+        self.start_btn.config(state="normal")
+        self.pause_btn.config(state="disabled", text="暂停")
+        self.stop_btn.config(state="disabled")
+        self.delete_btn.config(state="normal")
+        self.status_indicator.configure(bg="#22c55e")
 
     def to_config(self) -> dict:
         return {
             "phash": safe_int(self.phash_var.get(), 9),
             "color": safe_float(self.color_var.get(), 0.40),
             "algorithm": "gpu_features" if self.algorithm_label_var.get() == "GPU特征" else "phash",
+            "color_weight": self._color_weight.get(),
+            "texture_weight": self._texture_weight.get(),
+            "shape_weight": self._shape_weight.get(),
+            "similarity_threshold": self._similarity_threshold.get(),
+            "precision_mode": self._precision_mode.get(),
         }
 
     def apply_config(self, data: dict) -> None:
@@ -1106,12 +1721,17 @@ class SimilarDedupeTask:
         self.phash_var.set(max(0, min(64, safe_int(data.get("phash", 9), 9))))
         self.color_var.set(max(0.0, min(1.0, safe_float(data.get("color", 0.40), 0.40))))
         self.algorithm_label_var.set("GPU特征" if data.get("algorithm") == "gpu_features" else "pHash/颜色")
+        self._color_weight.set(data.get("color_weight", 0.40))
+        self._texture_weight.set(data.get("texture_weight", 0.30))
+        self._shape_weight.set(data.get("shape_weight", 0.30))
+        self._similarity_threshold.set(data.get("similarity_threshold", 75))
+        self._precision_mode.set(data.get("precision_mode", "balanced"))
 
 
 class TkImageBrowser:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("图片筛选工具")
+        self.root.title(f"图片筛选工具 {VERSION}")
         self.root.geometry("1280x840")
         self.root.minsize(1200, 800)
 
@@ -1147,12 +1767,32 @@ class TkImageBrowser:
         self._label_scan_id = 0
         self.labels_imported = False
         self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
-        self._cache_max = 20
+        self._cache_max = 200
+        self._original_sizes: dict[str, tuple[int, int]] = {}
         self._preload_idx = -1
         self._preload_thread: threading.Thread | None = None
+        self._loading_images: set[str] = set()
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ImageLoader")
+        self._preload_in_progress = False
+        self._current_loading_future = None
+        self._image_loading = False
+        self._photo_cache: dict[str, ImageTk.PhotoImage] = {}
+        self._photo_cache_max = 40
+        self._fast_render = False
+        self._last_nav_time = 0.0
+        self._quality_upgrade_after_id: str | None = None
+        self._pre_render_after_id: str | None = None
+        self._canvas_configure_after_id: str | None = None
+        self._canvas_image_id: int | None = None
+        self._canvas_label_ids: list[int] = []
+        self._canvas_label_text_ids: list[int] = []
+        self._cached_preload_size: tuple[int, int] | None = None
+        self._label_cache: dict[str, list] = {}
+        self._label_cache_max = 100
 
         self._build_ui()
-        self._restore_config()
+        
+        self.root.after(500, self._show_task_restore_prompt)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_queue)
         self.root.after(200, self._set_sash_positions)
@@ -1168,6 +1808,43 @@ class TkImageBrowser:
                 return json.load(f)
         except (OSError, json.JSONDecodeError):
             return {}
+
+    def _save_config(self) -> None:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _show_task_restore_prompt(self) -> None:
+        last_dir = self.config.get("last_dir", "")
+        last_index = self.config.get("last_index", 0)
+        has_prev_task = bool(last_dir)
+        
+        if not has_prev_task:
+            self._task_restore_choice = "none"
+            return
+        
+        self.root.update()
+        
+        result = messagebox.askyesnocancel(
+            "恢复任务",
+            f"检测到上次未完成的任务，是否恢复？\n\n上次目录: {last_dir}\n上次位置: 第 {last_index + 1} 张图片",
+            default=messagebox.YES
+        )
+        
+        if result is True:
+            self._task_restore_choice = "restore"
+            self.notify_flow("[任务] 即将恢复上次任务...")
+        elif result is False:
+            self._task_restore_choice = "clear"
+            self.config.clear()
+            self._save_config()
+            self.notify_flow("[任务] 已清空上次任务记录")
+        else:
+            self._task_restore_choice = "cancel"
+        
+        self.root.after(100, self._restore_config)
 
     def _detect_cuda_gpu(self) -> tuple[bool, str]:
         try:
@@ -1188,6 +1865,45 @@ class TkImageBrowser:
             messagebox.showinfo("GPU不可用", self.gpu_status_var.get())
         self._update_dedupe_tasks_phash_state()
         self._save_config()
+
+    def _show_about(self) -> None:
+        about_text = f"""🖼️ 图片浏览器
+
+版本号: {VERSION}
+作者: {AUTHOR}
+更新日期: {UPDATE_DATE}
+
+这是一款高效的图片浏览与数据筛选工具"""
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("关于")
+        dialog.geometry("320x280")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill="both", expand=True)
+
+        ttk.Label(main_frame, text="🖼️ 图片浏览器", font=("Microsoft YaHei UI", 16, "bold")).pack(pady=(10, 5))
+        ttk.Separator(main_frame, orient="horizontal").pack(fill="x", pady=10)
+
+        info_frame = ttk.Frame(main_frame)
+        info_frame.pack(pady=10)
+        ttk.Label(info_frame, text=f"版本号: {VERSION}", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(info_frame, text=f"作者: {AUTHOR}", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(info_frame, text=f"更新日期: {UPDATE_DATE}", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=3)
+
+        ttk.Separator(main_frame, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(main_frame, text="这是一款高效的图片浏览与标注工具", font=("Microsoft YaHei UI", 9), foreground="#666666").pack(pady=5)
+        ttk.Label(main_frame, text="© 2026 版权所有", font=("Microsoft YaHei UI", 8), foreground="#999999").pack(pady=5)
+
+        ttk.Button(main_frame, text="确定", command=dialog.destroy, style="Action.TButton").pack(pady=(15, 0))
+
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
 
     def _update_dedupe_tasks_phash_state(self) -> None:
         gpu_enabled = self.gpu_acceleration.get() and self._gpu_available
@@ -1226,6 +1942,7 @@ class TkImageBrowser:
             "last_index": self.current_index,
             "active_classes": [name for name, var in self.class_vars.items() if var.get()],
             "dedupe_tasks": [task.to_config() for task in getattr(self, "dedupe_tasks", [])],
+            "last_module": getattr(self, "_current_module", "browse"),
         }
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -1245,7 +1962,8 @@ class TkImageBrowser:
         self.yolo_type_var = StringVar(value="detect")
         self.detect_box_format_var = StringVar(value="xywh")
         self.move_target_var = StringVar()
-        self.labels_visible = BooleanVar(value=False)
+        self.labels_visible = BooleanVar(value=True)
+        self._auto_fit = BooleanVar(value=True)
         self.recursive = BooleanVar(value=bool(self.config.get("recursive", False)))
         self.keep_structure = BooleanVar(value=True)
         self.performance_mode = BooleanVar(value=bool(self.config.get("performance_mode", self.config.get("dedupe_performance_mode", False))))
@@ -1265,71 +1983,88 @@ class TkImageBrowser:
         style.configure("Nav.TButton", anchor="w", padding=(10, 8))
         style.configure("Active.Nav.TButton", anchor="w", padding=(10, 8))
         style.configure("Hint.TLabel", font=("Microsoft YaHei UI", 8), foreground="gray")
+        style.configure("Compact.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7))
+        style.configure("Action.TButton", padding=(6, 3), font=("Microsoft YaHei UI", 8), background="#3b82f6")
+        style.configure("Danger.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7), foreground="#ef4444")
+        style.configure("Accent.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7), foreground="#8b5cf6")
+        style.configure("CompactTask.TLabelframe", font=("Microsoft YaHei UI", 8))
         self.root.bind_all("<KeyPress>", self._on_keypress)
 
         main = ttk.Frame(self.root, padding=6)
         main.pack(fill="both", expand=True)
 
-        toolbar = ttk.Frame(main, padding=(4, 4))
-        toolbar.pack(fill="x")
-        ttk.Button(toolbar, text="打开目录", command=self.open_image_dir).pack(side="left")
-        ttk.Button(toolbar, text="上一张 A", command=self.prev_image).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="下一张 D", command=self.next_image).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="适应窗口 F", command=self.fit_image).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(toolbar, text="显示标签 T", variable=self.labels_visible, command=self.toggle_label_visibility).pack(side="left", padx=(12, 0))
-        ttk.Button(toolbar, text="目标目录", command=self.select_move_target).pack(side="left", padx=(12, 0))
-        ttk.Label(toolbar, textvariable=self.move_target_var, width=42, anchor="w").pack(side="left", padx=(6, 0))
-        self.gpu_check = ttk.Checkbutton(toolbar, text="GPU加速", variable=self.gpu_acceleration, command=self._on_gpu_toggle)
+        top_bar = ttk.Frame(main, padding=(4, 2))
+        top_bar.pack(fill="x")
+
+        nav_tabs = ttk.Frame(top_bar)
+        nav_tabs.pack(side="left", fill="x", expand=True)
+        for key, title in [
+            ("browse", "📁 数据浏览"),
+            ("labels", "🏷️ 标签显示"),
+            ("marks", "➡️ 标记转移"),
+            ("video", "🎬 视频抽帧"),
+            ("dedupe", "🔍 相似去重"),
+        ]:
+            btn = ttk.Button(nav_tabs, text=title, style="Nav.TButton", command=lambda k=key: self.show_panel(k))
+            btn.pack(side="left", padx=(0, 2))
+            self._nav_buttons[key] = btn
+
+        view_options = ttk.Frame(top_bar)
+        view_options.pack(side="left", padx=(20, 0))
+        ttk.Checkbutton(view_options, text="适应窗口", variable=self._auto_fit, command=self.fit_image).pack(side="left")
+        ttk.Checkbutton(view_options, text="显示标签", variable=self.labels_visible, command=self.toggle_label_visibility).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(view_options, text="最大性能", variable=self.performance_mode, command=self._save_config).pack(side="left", padx=(8, 0))
+
+        self.gpu_check = ttk.Checkbutton(top_bar, text="GPU加速", variable=self.gpu_acceleration, command=self._on_gpu_toggle)
         self.gpu_check.pack(side="right", padx=(8, 0))
         if not self._gpu_available:
             self.gpu_check.state(["disabled"])
-        ttk.Label(toolbar, textvariable=self.gpu_status_var, anchor="e").pack(side="right", padx=(8, 0))
+        ttk.Label(top_bar, textvariable=self.gpu_status_var, anchor="e").pack(side="right", padx=(8, 0))
+        ttk.Button(top_bar, text="ℹ️ 关于", command=self._show_about, width=6).pack(side="right")
 
         self.body = ttk.PanedWindow(main, orient="horizontal")
         self.body.pack(fill="both", expand=True, pady=(6, 0))
-
-        left = ttk.Frame(self.body, width=140, padding=2)
-        self.body.add(left, weight=0)
-        ttk.Label(left, text="工作流程", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
-        nav_frame = ttk.Frame(left)
-        nav_frame.pack(fill="x")
-        for key, title in [
-            ("browse", "数据浏览"),
-            ("labels", "标签显示"),
-            ("marks", "标记转移"),
-            ("video", "视频抽帧"),
-            ("dedupe", "相似去重"),
-        ]:
-            btn = ttk.Button(nav_frame, text=title, style="Nav.TButton", command=lambda k=key: self.show_panel(k))
-            btn.pack(fill="x", pady=2)
-            self._nav_buttons[key] = btn
-        ttk.Separator(left).pack(fill="x", pady=(8, 8))
-        flow_box = ttk.LabelFrame(left, text="流程显示")
-        flow_box.pack(fill="both", expand=True)
-        ttk.Button(flow_box, text="📜 历史", command=self._show_log_history).pack(fill="x", padx=4, pady=2)
-        flow_scroll = ttk.Scrollbar(flow_box)
-        flow_scroll.pack(side="right", fill="y")
-        self.flow_log = tk.Text(flow_box, state="disabled", wrap="word", yscrollcommand=flow_scroll.set)
-        self.flow_log.pack(side="left", fill="both", expand=True)
-        flow_scroll.config(command=self.flow_log.yview)
 
         center = ttk.Frame(self.body)
         self.body.add(center, weight=5)
         header = ttk.Frame(center, padding=(4, 0, 4, 4))
         header.pack(fill="x")
-        ttk.Label(header, text="图像查看区", style="Title.TLabel").pack(side="left")
+        self._module_title_var = StringVar(value="数据浏览")
+        ttk.Label(header, textvariable=self._module_title_var, style="Title.TLabel").pack(side="left")
         self.image_info_var = StringVar(value="未加载图片")
         ttk.Label(header, textvariable=self.image_info_var, anchor="e").pack(side="right")
+
+        nav_below = ttk.Frame(center)
+        nav_below.pack(fill="x", pady=(0, 2))
+        ttk.Label(nav_below, text="当前:", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(10, 2))
+        self._index_entry = tk.Entry(nav_below, width=5, justify="center", font=("Microsoft YaHei UI", 9, "bold"), bd=1, relief="solid")
+        self._index_entry.insert(0, "0")
+        self._index_entry.bind("<Return>", self._on_global_index_enter)
+        self._index_entry.bind("<FocusOut>", self._on_global_index_cancel)
+        self._index_entry.bind("<Escape>", lambda e: self._on_global_index_cancel(None) or self._index_entry.select_clear() or "break")
+        self._index_entry.pack(side="left")
+        self._total_label = ttk.Label(nav_below, text=" / 0", font=("Microsoft YaHei UI", 9, "bold"))
+        self._total_label.pack(side="left")
+        ttk.Button(nav_below, text="◀ 上一张", command=self.prev_image, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(nav_below, text="下一张 ▶", command=self.next_image, width=10).pack(side="left", padx=(4, 0))
+
         self.center_content = ttk.Frame(center)
         self.center_content.pack(fill="both", expand=True)
         self.image_canvas_host = ttk.Frame(self.center_content)
         self.image_canvas_host.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(self.image_canvas_host, bg="#202124", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda _e: self.render_image())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+
+        self.image_slider_frame = ttk.Frame(self.image_canvas_host)
+        self.image_slider_frame.pack(fill="x", pady=(2, 0))
+        self.image_slider_scale = ttk.Scale(self.image_slider_frame, from_=0, to=1000, orient="horizontal", command=self._on_image_scale_change, length=200)
+        self.image_slider_scale.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
         self.dedupe_center = ttk.Frame(self.center_content)
         self.dedupe_summary_bar = ttk.Frame(self.dedupe_center, padding=(8, 6))
         self.dedupe_summary_bar.pack(fill="x")
@@ -1343,10 +2078,10 @@ class TkImageBrowser:
         )
         self.dedupe_canvas_view.pack(fill="both", expand=True)
 
-        right = ttk.Frame(self.body, width=380, padding=8)
+        right = ttk.Frame(self.body, width=360, padding=6)
         self.body.add(right, weight=0)
-        ttk.Label(right, text="参数与任务", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
-        ttk.Checkbutton(right, text="最大性能（保留系统余量）", variable=self.performance_mode, command=self._save_config).pack(anchor="w", pady=(0, 8))
+        self._param_title_var = StringVar(value="参数设置")
+        ttk.Label(right, textvariable=self._param_title_var, style="Title.TLabel").pack(anchor="w", pady=(0, 6))
         self.panel_scroll = ScrollFrame(right)
         self.panel_scroll.pack(fill="both", expand=True)
         self.panel_host = self.panel_scroll.inner
@@ -1357,11 +2092,42 @@ class TkImageBrowser:
         self._build_dedupe_panel()
         self.show_panel("browse")
 
-        bottom = ttk.Frame(main)
+        bottom = ttk.LabelFrame(main, text="操作日志", padding=(6, 4))
         bottom.pack(fill="x", pady=(6, 0))
-        ttk.Progressbar(bottom, variable=self.progress_var, maximum=100, length=280).pack(side="left")
-        ttk.Label(bottom, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True, padx=(8, 0))
-        ttk.Checkbutton(bottom, text="完成关机", variable=self.auto_shutdown, command=self._on_auto_shutdown_toggle).pack(side="right", padx=(8, 0))
+        log_toolbar = ttk.Frame(bottom)
+        log_toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(log_toolbar, text="📜 历史记录", command=self._show_log_history, width=12).pack(side="left")
+        ttk.Button(log_toolbar, text="清空", command=self._clear_flow_log, width=6).pack(side="left", padx=(4, 0))
+        self._log_filter_var = StringVar(value="all")
+        ttk.Label(log_toolbar, text="筛选:", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(8, 0))
+        for val, txt in [("all", "全部"), ("info", "信息"), ("warn", "警告"), ("error", "错误")]:
+            ttk.Radiobutton(log_toolbar, text=txt, variable=self._log_filter_var, value=val, command=self._filter_log).pack(side="left", padx=(2, 0))
+
+        shutdown_frame = ttk.Frame(log_toolbar)
+        shutdown_frame.pack(side="right", padx=(4, 0))
+        ttk.Checkbutton(shutdown_frame, text="🔌 完成关机", variable=self.auto_shutdown, command=self._on_auto_shutdown_toggle).pack(side="left")
+
+        progress_frame = ttk.Frame(log_toolbar)
+        progress_frame.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100, length=150).pack(side="left", padx=(0, 4))
+        self._status_label = ttk.Label(progress_frame, textvariable=self.status_var, anchor="w", font=("Microsoft YaHei UI", 8))
+        self._status_label.pack(side="left", fill="x", expand=True)
+
+        log_frame = ttk.Frame(bottom)
+        log_frame.pack(fill="x")
+        self.flow_log = tk.Text(log_frame, height=3, state="disabled", wrap="word", font=("Microsoft YaHei UI", 8), bg="#f6f7f9")
+        self.flow_log.pack(side="left", fill="x", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, command=self.flow_log.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.flow_log.config(yscrollcommand=log_scroll.set)
+
+    def _clear_flow_log(self) -> None:
+        self.flow_log.config(state="normal")
+        self.flow_log.delete("1.0", "end")
+        self.flow_log.config(state="disabled")
+
+    def _filter_log(self) -> None:
+        pass
 
     def _register_panel(self, key: str) -> ttk.Frame:
         panel = ttk.Frame(self.panel_host, padding=8)
@@ -1370,8 +2136,7 @@ class TkImageBrowser:
 
     def _set_sash_positions(self) -> None:
         if hasattr(self, "body"):
-            self.body.sashpos(0, 140)
-            self.body.sashpos(1, self.root.winfo_width() - 380)
+            self.body.sashpos(0, self.root.winfo_width() - 400)
 
     _PANEL_NAMES: dict[str, str] = {
         "browse": "数据浏览",
@@ -1389,13 +2154,30 @@ class TkImageBrowser:
         for panel in self._panels.values():
             panel.pack_forget()
         self._panels[key].pack(fill="both", expand=True)
+        colors = {
+            "browse": "#3b82f6",
+            "labels": "#8b5cf6",
+            "marks": "#f59e0b",
+            "video": "#10b981",
+            "dedupe": "#ef4444",
+        }
         for nav_key, button in self._nav_buttons.items():
-            button.configure(style="Active.Nav.TButton" if nav_key == key else "Nav.TButton")
+            if nav_key == key:
+                button.configure(style="Active.Nav.TButton")
+                button.widget_showing_active = True
+            else:
+                button.configure(style="Nav.TButton")
+                button.widget_showing_active = False
         self._current_module = key
         self._show_center_view("dedupe" if key == "dedupe" else "image")
         self._restore_module_state(key)
         name = self._PANEL_NAMES.get(key, key)
+        if hasattr(self, "_module_title_var"):
+            self._module_title_var.set(name)
+        if hasattr(self, "_param_title_var"):
+            self._param_title_var.set(f"{name} - 参数设置")
         self._append_module_log(key, f"[切换] 进入功能：{name}", show=True)
+        self._save_config()
 
     def _show_center_view(self, view: str) -> None:
         if not hasattr(self, "image_canvas_host"):
@@ -1424,7 +2206,10 @@ class TkImageBrowser:
     def _restore_module_state(self, module: str) -> None:
         if module in self._module_status:
             status, progress = self._module_status[module]
-            self.status_var.set(status)
+            display_status = status
+            if len(display_status) > 40:
+                display_status = display_status[:37] + "..."
+            self.status_var.set(display_status)
             if progress is not None and hasattr(self, 'progress_var'):
                 self.progress_var.set(progress)
         elif hasattr(self, 'progress_var'):
@@ -1445,7 +2230,10 @@ class TkImageBrowser:
         self._module_status[module] = (next_message, next_progress)
         if module == self._current_module:
             if message is not None:
-                self.status_var.set(message)
+                display_msg = message
+                if len(display_msg) > 40:
+                    display_msg = display_msg[:37] + "..."
+                self.status_var.set(display_msg)
             if progress is not None:
                 self.progress_var.set(progress)
         if log and message:
@@ -1467,10 +2255,25 @@ class TkImageBrowser:
             self.log_flow(message)
 
     def _show_log_history(self) -> None:
-        if not hasattr(self, '_log_history_win'):
+        win_exists = hasattr(self, '_log_history_win') and self._log_history_win is not None
+        try:
+            if win_exists:
+                self._log_history_win.winfo_exists()
+        except Exception:
+            win_exists = False
+
+        if not win_exists:
             win = tk.Toplevel(self.root)
             win.title("日志历史")
             win.geometry("700x500")
+
+            def on_close():
+                self._log_history_win = None
+                self._log_history_text = None
+                win.destroy()
+
+            win.protocol("WM_DELETE_WINDOW", on_close)
+
             text = tk.Text(win, wrap="word")
             text.pack(fill="both", expand=True)
             scroll = ttk.Scrollbar(text)
@@ -1481,6 +2284,7 @@ class TkImageBrowser:
             self._log_history_win = win
         else:
             self._log_history_win.deiconify()
+            self._log_history_win.lift()
         text = self._log_history_text
         text.configure(state="normal")
         text.delete("1.0", "end")
@@ -1493,16 +2297,38 @@ class TkImageBrowser:
 
     def _build_browse_panel(self) -> None:
         tab = self._register_panel("browse")
-        ttk.Label(tab, text="数据浏览", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
-        ttk.Button(tab, text="打开图片目录", command=self.open_image_dir).pack(fill="x")
-        ttk.Checkbutton(tab, text="递归子目录", variable=self.recursive).pack(anchor="w", pady=4)
-        ttk.Label(tab, textvariable=self.dir_var, wraplength=330).pack(fill="x", pady=(0, 8))
-        nav = ttk.Frame(tab)
-        nav.pack(fill="x", pady=4)
-        ttk.Button(nav, text="上一张 A", command=self.prev_image).pack(side="left", fill="x", expand=True)
-        ttk.Button(nav, text="下一张 D", command=self.next_image).pack(side="left", fill="x", expand=True, padx=(6, 0))
-        ttk.Button(tab, text="适应窗口", command=self.fit_image).pack(fill="x", pady=4)
-        ttk.Checkbutton(tab, text="显示标签", variable=self.labels_visible, command=self.toggle_label_visibility).pack(anchor="w")
+
+        info_bar = ttk.Frame(tab, padding=(0, 4))
+        info_bar.pack(fill="x")
+        self._img_count_label = ttk.Label(info_bar, text="图片: 0", font=("Microsoft YaHei UI", 8), foreground="#64748b")
+        self._img_count_label.pack(side="left")
+        self._cur_idx_label = ttk.Label(info_bar, text="当前: 0/0", font=("Microsoft YaHei UI", 8), foreground="#3b82f6")
+        self._cur_idx_label.pack(side="left", padx=(12, 0))
+        ttk.Label(info_bar, textvariable=self.dir_var, font=("Microsoft YaHei UI", 7), foreground="#64748b", wraplength=250).pack(side="right", fill="x", expand=True, padx=(20, 0))
+
+        dir_row = ttk.Frame(tab)
+        dir_row.pack(fill="x", pady=(0, 4))
+        ttk.Button(dir_row, text="选择目录", command=self.open_image_dir, width=10, style="Action.TButton").pack(side="left")
+        ttk.Checkbutton(dir_row, text="递归子目录", variable=self.recursive).pack(side="left", padx=(8, 0))
+
+        stats_row = ttk.LabelFrame(tab, text="图片统计", padding=(6, 4))
+        stats_row.pack(fill="x", pady=(0, 6))
+        stats_inner = ttk.Frame(stats_row)
+        stats_inner.pack(fill="x")
+        ttk.Label(stats_inner, text="已加载:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+        self._loaded_count_var = StringVar(value="0")
+        ttk.Label(stats_inner, textvariable=self._loaded_count_var, font=("Microsoft YaHei UI", 7, "bold"), foreground="#3b82f6").pack(side="left", padx=(2, 12))
+        ttk.Label(stats_inner, text="已标记:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+        self._marked_count_var2 = StringVar(value="0")
+        ttk.Label(stats_inner, textvariable=self._marked_count_var2, font=("Microsoft YaHei UI", 7, "bold"), foreground="#f59e0b").pack(side="left", padx=(2, 12))
+        ttk.Label(stats_inner, text="已标记转移:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+        self._transfer_count_var = StringVar(value="0")
+        ttk.Label(stats_inner, textvariable=self._transfer_count_var, font=("Microsoft YaHei UI", 7, "bold"), foreground="#10b981").pack(side="left", padx=(2, 0))
+
+        info_row = ttk.LabelFrame(tab, text="图片信息", padding=(6, 4))
+        info_row.pack(fill="x")
+        self._img_info_text = tk.Text(info_row, height=4, font=("Microsoft YaHei UI", 7), state="disabled", bg="#f6f7f9")
+        self._img_info_text.pack(fill="x")
 
     def _build_label_panel(self) -> None:
         tab = self._register_panel("labels")
@@ -1533,6 +2359,15 @@ class TkImageBrowser:
         ttk.Label(tab, textvariable=self.classes_file_var, wraplength=330).pack(fill="x", pady=(0, 4))
         ttk.Button(tab, text="选择 COCO JSON", command=self.select_coco).pack(fill="x")
         ttk.Label(tab, textvariable=self.coco_file_var, wraplength=330).pack(fill="x", pady=(0, 4))
+        self.label_progress_frame = ttk.Frame(tab)
+        self.label_progress_frame.pack(fill="x", pady=(0, 4))
+        self.label_progress_var = tk.DoubleVar(value=0)
+        self.label_progress_bar = ttk.Progressbar(self.label_progress_frame, variable=self.label_progress_var, maximum=100, mode="determinate")
+        self.label_progress_bar.pack(side="left", fill="x", expand=True)
+        self.label_progress_text = ttk.Label(self.label_progress_frame, text="0/0", font=("Microsoft YaHei UI", 7), foreground="#64748b", width=10)
+        self.label_progress_text.pack(side="left", padx=(4, 0))
+        self.label_progress_frame.pack_forget()
+
         ttk.Label(tab, text="标签匹配图片列表").pack(anchor="w")
         self.label_tree = ttk.Treeview(tab, columns=("status", "image", "label"), show="headings", height=4)
         self.label_tree.heading("status", text="导入")
@@ -1549,55 +2384,269 @@ class TkImageBrowser:
 
     def _build_mark_panel(self) -> None:
         tab = self._register_panel("marks")
-        ttk.Label(tab, text="标记转移", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
-        ttk.Label(tab, text="标记分类，一行一个").pack(anchor="w")
-        self.category_text = tk.Text(tab, height=5)
+
+        header = ttk.Frame(tab)
+        header.pack(fill="x", pady=(0, 6))
+        self._mark_count_label = ttk.Label(header, text="待转移: 0 张", font=("Microsoft YaHei UI", 8), foreground="#64748b")
+        self._mark_count_label.pack(side="right")
+
+        ttk.Separator(tab).pack(fill="x", pady=6)
+
+        ttk.Label(tab, text="标记分类，一行一个", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        self.category_text = tk.Text(tab, height=3, font=("Microsoft YaHei UI", 8))
         self.category_text.pack(fill="x")
         cats = self.config.get("categories") or ["漏检", "误检"]
         self.category_text.insert("1.0", "\n".join(cats))
-        ttk.Button(tab, text="刷新分类按钮", command=self.refresh_mark_buttons).pack(fill="x", pady=4)
+        cat_btn_row = ttk.Frame(tab)
+        cat_btn_row.pack(fill="x", pady=4)
+        ttk.Button(cat_btn_row, text="新建分类标签", command=self._add_category_tag).pack(side="left", fill="x", expand=True)
+        ttk.Button(cat_btn_row, text="删除分类标签", command=self._delete_category_tag).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(cat_btn_row, text="刷新按钮", command=self.refresh_mark_buttons).pack(side="left", fill="x", expand=True, padx=(4, 0))
         self.mark_buttons = ttk.Frame(tab)
         self.mark_buttons.pack(fill="x", pady=4)
-        ttk.Separator(tab).pack(fill="x", pady=8)
+
+        ttk.Separator(tab).pack(fill="x", pady=6)
+
         ttk.Button(tab, text="选择转移目标目录", command=self.select_move_target).pack(fill="x")
-        ttk.Label(tab, textvariable=self.move_target_var, wraplength=330).pack(fill="x", pady=(0, 4))
+        ttk.Label(tab, textvariable=self.move_target_var, wraplength=330, font=("Microsoft YaHei UI", 7)).pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(tab, text="保留原始子目录结构", variable=self.keep_structure).pack(anchor="w")
-        ttk.Button(tab, text="移动当前图片到目标目录", command=self.move_current_image).pack(fill="x", pady=4)
-        ttk.Label(tab, text="按标记类别批量转移").pack(anchor="w", pady=(8, 0))
+
+        self.mark_transfer_preview = tk.Text(tab, height=3, state="disabled", bg="#f6f7f9", font=("Microsoft YaHei UI", 7))
+        self.mark_transfer_preview.pack(fill="x", pady=(6, 4))
+
+        btn_row = ttk.Frame(tab)
+        btn_row.pack(fill="x", pady=4)
+        ttk.Button(btn_row, text="转移当前图片", command=self.move_current_image_with_confirm).pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_row, text="全选待转移", command=self.select_all_marked_for_transfer).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        ttk.Label(tab, text="按标记类别批量转移", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(6, 0))
         self.batch_category_var = StringVar()
         self.batch_category_combo = ttk.Combobox(tab, textvariable=self.batch_category_var, state="readonly")
         self.batch_category_combo.pack(fill="x", pady=4)
-        ttk.Button(tab, text="执行批量转移", command=self.move_marked_images).pack(fill="x")
+
+        batch_row = ttk.Frame(tab)
+        batch_row.pack(fill="x")
+        ttk.Button(batch_row, text="执行批量转移", command=self.move_marked_images_with_confirm).pack(side="left", fill="x", expand=True)
+        ttk.Button(batch_row, text="预览文件", command=self.preview_marked_files).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        self.marked_count_var = StringVar(value="待转移: 0 张")
+        ttk.Label(tab, textvariable=self.marked_count_var, font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(anchor="w", pady=(4, 0))
+
+        ttk.Separator(tab).pack(fill="x", pady=6)
+
+        delete_frame = ttk.LabelFrame(tab, text="原始文件删除队列", padding=4)
+        delete_frame.pack(fill="x")
+        self.delete_queue_var = StringVar(value="待删除: 0 个文件")
+        ttk.Label(delete_frame, textvariable=self.delete_queue_var, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        self.delete_queue_list = tk.Listbox(delete_frame, height=2, font=("Microsoft YaHei UI", 7))
+        self.delete_queue_list.pack(fill="x", pady=4)
+        btn_del = ttk.Frame(delete_frame)
+        btn_del.pack(fill="x")
+        ttk.Button(btn_del, text="添加到删除队列", command=self.add_to_delete_queue).pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_del, text="执行删除", command=self.execute_delete_queue).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(btn_del, text="清空队列", command=self.clear_delete_queue).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
         self.refresh_mark_buttons()
+        self._delete_queue: list[str] = []
+        self._marked_images: list[str] = []
+        self._current_mark_index = 0
+
+    def select_all_marked_for_transfer(self) -> None:
+        if not hasattr(self, "_marked_images") or not self._marked_images:
+            self._load_marked_images()
+        if hasattr(self, "_marked_images") and self._marked_images:
+            for path in self._marked_images:
+                if path not in self._selected_for_transfer:
+                    self._selected_for_transfer.add(path)
+            self._update_mark_transfer_preview()
+
+    def preview_marked_files(self) -> None:
+        self._load_marked_images()
+        if not hasattr(self, "_marked_images") or not self._marked_images:
+            messagebox.showinfo("提示", "没有找到待转移的图片")
+            return
+        preview_text = f"待转移图片 ({len(self._marked_images)} 张):\n"
+        for i, path in enumerate(self._marked_images[:20]):
+            preview_text += f"  {i+1}. {Path(path).name}\n"
+        if len(self._marked_images) > 20:
+            preview_text += f"  ... 还有 {len(self._marked_images) - 20} 张\n"
+        self.mark_transfer_preview.config(state="normal")
+        self.mark_transfer_preview.delete("1.0", "end")
+        self.mark_transfer_preview.insert("1.0", preview_text)
+        self.mark_transfer_preview.config(state="disabled")
+
+    def _load_marked_images(self) -> None:
+        category = self.batch_category_var.get()
+        if not category:
+            cats = self._categories()
+            category = cats[0] if cats else ""
+        if not category:
+            self._marked_images = []
+            return
+        paths: set[str] = set()
+        root = Path(self.dir_var.get()) if self.dir_var.get() else Path(".")
+        try:
+            mark_files = list(root.rglob(f"{category}.txt")) if self.recursive.get() else list((Path(self.dir_var.get()) if self.dir_var.get() else Path(".")).glob(f"{category}.txt"))
+        except OSError:
+            mark_files = []
+        for mark_path in mark_files:
+            try:
+                with open(mark_path, "r", encoding="utf-8") as f:
+                    paths.update(line.strip() for line in f if line.strip())
+            except OSError:
+                continue
+        self._marked_images = sorted(paths)
+        self._selected_for_transfer = set(self._marked_images)
+        self.mark_slider.set_range(0, max(len(self._marked_images) - 1, 1))
+        self.marked_count_var.set(f"待转移: {len(self._marked_images)} 张")
+
+    def _update_mark_transfer_preview(self) -> None:
+        if not hasattr(self, "_marked_images"):
+            return
+        selected = len(getattr(self, "_selected_for_transfer", set()))
+        total = len(self._marked_images)
+        preview_text = f"已选 {selected}/{total} 张待转移图片\n"
+        if hasattr(self, "_selected_for_transfer"):
+            for path in list(self._selected_for_transfer)[:10]:
+                preview_text += f"  • {Path(path).name}\n"
+            if len(self._selected_for_transfer) > 10:
+                preview_text += f"  ... 还有 {len(self._selected_for_transfer) - 10} 张\n"
+        self.mark_transfer_preview.config(state="normal")
+        self.mark_transfer_preview.delete("1.0", "end")
+        self.mark_transfer_preview.insert("1.0", preview_text)
+        self.mark_transfer_preview.config(state="disabled")
+
+    def move_current_image_with_confirm(self) -> None:
+        if not (0 <= self.current_index < len(self.image_paths)):
+            self.notify_flow("[转移] 未选择图片")
+            messagebox.showwarning("提示", "请先选择图片")
+            return
+        src = self.image_paths[self.current_index]
+        result = messagebox.askyesnocancel(
+            "确认转移",
+            f"确定要转移当前图片吗？\n\n文件: {Path(src).name}\n路径: {src}",
+            parent=self.root
+        )
+        if result is None:
+            return
+        if result:
+            ok, lbl, err = move_with_labels(src, self.move_target_var.get(), self.dir_var.get(), self.label_dir_var.get(), self.keep_structure.get())
+            if not ok:
+                self.notify_flow(f"[转移] 移动失败: {err}")
+                messagebox.showerror("移动失败", err)
+                return
+            self.image_paths.pop(self.current_index)
+            self.current_index = min(self.current_index, len(self.image_paths) - 1)
+            self.notify_flow(f"[转移] 已移动当前图片，同步标签 {lbl} 个")
+            self.show_current_image()
+
+    def move_marked_images_with_confirm(self) -> None:
+        self._load_marked_images()
+        category = self.batch_category_var.get()
+        target = self.move_target_var.get()
+        if not category or not target or not self.dir_var.get():
+            self.notify_flow("[批量转移] 请选择分类、图片目录和目标目录")
+            messagebox.showwarning("提示", "请选择分类、图片目录和目标目录")
+            return
+        if not hasattr(self, "_marked_images") or not self._marked_images:
+            self.notify_flow("[批量转移] 没有找到该分类的标记图片")
+            messagebox.showinfo("提示", "没有找到该分类的标记图片")
+            return
+        paths = list(getattr(self, "_selected_for_transfer", set()))
+        if not paths:
+            paths = self._marked_images
+        confirm_msg = f"确定要转移以下 {len(paths)} 张图片吗？\n\n目标目录: {target}\n分类: {category}"
+        result = messagebox.askyesnocancel("确认批量转移", confirm_msg, parent=self.root)
+        if result is None:
+            return
+        if result:
+            self._run_thread(self._move_many_worker, paths, target, self.dir_var.get(), self.label_dir_var.get(), "批量转移完成")
+
+    def add_to_delete_queue(self) -> None:
+        if not (0 <= self.current_index < len(self.image_paths)):
+            messagebox.showinfo("提示", "未选择要删除的图片")
+            return
+        path = self.image_paths[self.current_index]
+        if path not in self._delete_queue:
+            self._delete_queue.append(path)
+            self.delete_queue_list.insert("end", Path(path).name)
+            self.delete_queue_var.set(f"待删除: {len(self._delete_queue)} 个文件")
+
+    def execute_delete_queue(self) -> None:
+        if not self._delete_queue:
+            messagebox.showinfo("提示", "删除队列为空")
+            return
+        confirm_msg = f"确定要删除以下 {len(self._delete_queue)} 个文件吗？\n\n此操作不可恢复！"
+        result = messagebox.askyesno("确认删除", confirm_msg, parent=self.root)
+        if not result:
+            return
+        success = fail = 0
+        for path in list(self._delete_queue):
+            try:
+                Path(path).unlink()
+                self._delete_queue.remove(path)
+                self.delete_queue_list.delete(0)
+                success += 1
+            except Exception as e:
+                fail += 1
+                self._append_module_log("marks", f"[删除] 删除失败: {path} - {e}")
+        self.delete_queue_var.set(f"待删除: {len(self._delete_queue)} 个文件")
+        self.notify_flow(f"[删除] 完成: 成功 {success}，失败 {fail}")
+        self._save_config()
+
+    def clear_delete_queue(self) -> None:
+        self._delete_queue.clear()
+        self.delete_queue_list.delete(0, "end")
+        self.delete_queue_var.set(f"待删除: 0 个文件")
 
     def _build_video_panel(self) -> None:
         tab = self._register_panel("video")
         ttk.Label(tab, text="视频抽帧", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
 
-        self.video_tasks_frame = tk.Canvas(tab)
-        self.video_tasks_frame.pack(fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=self.video_tasks_frame.yview)
+        self.video_tasks_container = tk.Canvas(tab, bg="#f6f7f9", highlightthickness=0)
+        self.video_tasks_container.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=self.video_tasks_container.yview)
         scrollbar.pack(side="right", fill="y")
-        self.video_tasks_frame.configure(yscrollcommand=scrollbar.set)
+        self.video_tasks_container.configure(yscrollcommand=scrollbar.set)
 
-        self.video_tasks_inner = ttk.Frame(self.video_tasks_frame)
-        self.video_tasks_frame.create_window((0, 0), window=self.video_tasks_inner, anchor="nw")
+        self.video_tasks_inner = ttk.Frame(self.video_tasks_container)
+        self.video_tasks_window = self.video_tasks_container.create_window((0, 0), window=self.video_tasks_inner, anchor="nw")
 
         self.video_tasks: list[VideoExtractTask] = []
         self._next_video_task_id = 1
+        self.video_summary_var = StringVar(value="任务数: 1")
         self._add_video_task()
 
         ttk.Button(tab, text="+ 新建抽帧任务", command=self._add_video_task).pack(fill="x", pady=(10, 0))
 
-        def on_frame_configure(_):
-            self.video_tasks_frame.configure(scrollregion=self.video_tasks_frame.bbox("all"))
+        ttk.Label(tab, textvariable=self.video_summary_var, font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(anchor="e", pady=(4, 0))
+
+        def on_frame_configure(_event: tk.Event) -> None:
+            self.video_tasks_container.configure(scrollregion=self.video_tasks_container.bbox("all"))
+            self._check_layout_mode()
+
+        def on_canvas_configure(_event: tk.Event) -> None:
+            self.video_tasks_container.itemconfig(self.video_tasks_window, width=_event.width)
+            self._check_layout_mode()
+
         self.video_tasks_inner.bind("<Configure>", on_frame_configure)
+        self.video_tasks_container.bind("<Configure>", on_canvas_configure)
+
+        style = ttk.Style(tab)
+        style.configure("VideoTask.TLabelframe", background="#f6f7f9")
+
+    def _check_layout_mode(self) -> None:
+        task_count = len(self.video_tasks)
+        self.video_summary_var.set(f"任务数: {task_count}")
 
     def _add_video_task(self) -> None:
         task_id = self._next_video_task_id
         self._next_video_task_id += 1
         task = VideoExtractTask(self.video_tasks_inner, task_id, self._on_video_task_update, self._on_video_task_delete, lambda: self.performance_mode.get())
         self.video_tasks.append(task)
+        self._check_layout_mode()
+        self.video_tasks_inner.update_idletasks()
+        self.video_tasks_container.configure(scrollregion=self.video_tasks_container.bbox("all"))
 
     def _on_video_task_update(self, task_id: int, msg: str, progress: float | None) -> None:
         for task in self.video_tasks:
@@ -1667,7 +2716,7 @@ class TkImageBrowser:
         self.dedupe_result = ScrollFrame(tab)
         self.dedupe_result.pack(fill="x", pady=(4, 0))
         ttk.Label(self.dedupe_result.inner, text="扫描结果会显示在中间图像区域").pack(anchor="w")
-        self.dedupe_canvas_view.set_message("请先在右侧启动相似去重任务")
+        self.dedupe_canvas_view.set_message("相似去重任务未启动")
 
     def _add_dedupe_task(self) -> None:
         task_id = self._next_dedupe_task_id
@@ -1777,6 +2826,13 @@ class TkImageBrowser:
             task.set_view_state(task.task_id in self._dedupe_task_states, task.task_id == self._displayed_dedupe_task_id)
 
     def _restore_config(self) -> None:
+        choice = getattr(self, "_task_restore_choice", "restore")
+        if choice == "clear" or choice == "none":
+            self.config["last_dir"] = ""
+            self.config["last_index"] = 0
+            if choice == "none":
+                return
+        
         self.dir_var.set(self.config.get("last_dir", ""))
         self.label_dir_var.set(self.config.get("label_dir", ""))
         self.classes_file_var.set(self.config.get("classes_file", ""))
@@ -1796,11 +2852,105 @@ class TkImageBrowser:
             self._reset_dedupe_tasks_from_config(tasks_config)
         self._update_dedupe_tasks_phash_state()
         self.refresh_current_labels()
+        last_module = self.config.get("last_module", "browse")
+        if last_module in self._PANEL_NAMES:
+            self.root.after(300, lambda: self.show_panel(last_module))
         if self.dir_var.get():
-            self.notify_flow("[启动] 已恢复上次路径，请点击“打开目录”开始加载图片")
+            self.root.after(500, self._restore_last_directory)
+
+    def _restore_last_directory(self) -> None:
+        dir_path = self.dir_var.get()
+        if not dir_path:
+            return
+        last_index = self.config.get("last_index", 0)
+        self.notify_flow(f"[启动] 正在恢复上次目录: {dir_path}")
+        if Path(dir_path).exists():
+            self.load_image_dir(dir_path)
+            if 0 < last_index < len(self.image_paths):
+                self.current_index = last_index - 1
+                self.show_current_image()
+            self.notify_flow(f"[启动] 已恢复任务，当前位置: 第 {last_index} 张图片")
+        else:
+            self.notify_flow(f"[启动] 上次目录不存在: {dir_path}")
 
     def _categories(self) -> list[str]:
         return [line.strip() for line in self.category_text.get("1.0", "end").splitlines() if line.strip()]
+
+    def _add_category_tag(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("新建分类标签")
+        dialog.geometry("300x120")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        x = self.root.winfo_x() + 200
+        y = self.root.winfo_y() + 200
+        dialog.geometry(f"+{x}+{y}")
+
+        ttk.Label(dialog, text="请输入新的分类标签名称:").pack(pady=(15, 5))
+        entry = ttk.Entry(dialog, width=30)
+        entry.pack(pady=5)
+        entry.focus_set()
+
+        def do_add():
+            name = entry.get().strip()
+            if not name:
+                return
+            current = self.category_text.get("1.0", "end-1c")
+            categories = [c.strip() for c in current.split("\n") if c.strip()]
+            if name not in categories:
+                categories.append(name)
+                self.category_text.delete("1.0", "end")
+                self.category_text.insert("1.0", "\n".join(categories))
+                self.refresh_mark_buttons()
+                self._save_config()
+                self.notify_flow(f"[分类] 已添加新分类: {name}")
+            dialog.destroy()
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(pady=10)
+        ttk.Button(btn_row, text="确定", command=do_add, width=10).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="取消", command=dialog.destroy, width=10).pack(side="left", padx=4)
+        entry.bind("<Return>", lambda e: do_add())
+
+    def _delete_category_tag(self) -> None:
+        current = self.category_text.get("1.0", "end-1c")
+        categories = [c.strip() for c in current.split("\n") if c.strip()]
+        if not categories:
+            messagebox.showinfo("提示", "当前没有可删除的分类标签")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("删除分类标签")
+        dialog.geometry("300x150")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        x = self.root.winfo_x() + 200
+        y = self.root.winfo_y() + 200
+        dialog.geometry(f"+{x}+{y}")
+
+        ttk.Label(dialog, text="选择要删除的分类标签:").pack(pady=(15, 5))
+        combo_var = StringVar(value=categories[0])
+        combo = ttk.Combobox(dialog, textvariable=combo_var, values=categories, state="readonly", width=25)
+        combo.pack(pady=5)
+
+        def do_delete():
+            name = combo_var.get()
+            if not name:
+                return
+            categories_new = [c for c in categories if c != name]
+            self.category_text.delete("1.0", "end")
+            self.category_text.insert("1.0", "\n".join(categories_new))
+            self.refresh_mark_buttons()
+            self._save_config()
+            self.notify_flow(f"[分类] 已删除分类: {name}")
+            dialog.destroy()
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(pady=10)
+        ttk.Button(btn_row, text="删除", command=do_delete, width=10).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="取消", command=dialog.destroy, width=10).pack(side="left", padx=4)
 
     def refresh_mark_buttons(self) -> None:
         for child in self.mark_buttons.winfo_children():
@@ -1883,6 +3033,10 @@ class TkImageBrowser:
         self.log_label(f"开始匹配图片列表，共 {len(paths)} 张图片")
         self.set_busy("[标签] 已启动后台匹配，界面可继续操作", 0)
         self.notify_flow(f"[标签] 后台匹配任务已提交，共 {len(paths)} 张图片")
+        if hasattr(self, "label_progress_frame"):
+            self.label_progress_frame.pack(fill="x", pady=(0, 4), before=self.label_tree)
+            self.label_progress_var.set(0)
+            self.label_progress_text.config(text=f"0/{len(paths)}")
         if async_scan:
             self._run_thread(self._label_scan_worker, scan_id, paths)
         else:
@@ -1959,7 +3113,7 @@ class TkImageBrowser:
     def _dedupe_transfer_and_next(self) -> None:
         selected = [p for p, v in self.dedupe_selected.items() if v.get()]
         if not selected:
-            self.dedupe_status_var.set("[相似去重] 请先勾选要转移的图片")
+            self.dedupe_status_var.set("[相似去重] 未勾选要转移的图片")
             return
         self._transfer_selected_duplicates()
         self.next_image()
@@ -2050,6 +3204,9 @@ class TkImageBrowser:
         self._image_cache.clear()
         self.current_index = 0 if self.image_paths else -1
         self.dir_var.set(path)
+        self.config["last_dir"] = path
+        self.config["last_index"] = self.current_index
+        self._save_config()
         self.set_busy(f"[图片] 已加载 {len(self.image_paths)} 张图片", 60)
         self.clear_label_image_list("标签未导入，请在“标签显示”中选择标签目录")
         last_dir = self.config.get("last_dir", "")
@@ -2074,17 +3231,100 @@ class TkImageBrowser:
         if path in self._image_cache:
             self._image_cache.move_to_end(path)
             self.current_image = self._image_cache[path]
-        else:
+            self._render_current_image(path)
+            return
+
+        self._loading_images.discard(path)
+        self._loading_images.add(path)
+        self._current_loading_path = path
+        self._corrupted_skip_count = getattr(self, '_corrupted_skip_count', 0)
+
+        def _load_image():
             try:
                 with Image.open(path) as img:
-                    self.current_image = img.convert("RGB")
+                    img.load()
+                    img_copy = img.convert("RGB")
+                    self._original_sizes[path] = (img_copy.width, img_copy.height)
+                
+                if getattr(self, '_current_loading_path', '') != path:
+                    self._loading_images.discard(path)
+                    return
+                
+                if path not in self._image_cache:
+                    self._image_cache[path] = img_copy
+                    if len(self._image_cache) > self._cache_max:
+                        self._image_cache.popitem(last=False)
+                self._loading_images.discard(path)
+                self._image_loading = False
+                self.root.after(0, lambda: self._on_image_loaded(path))
             except Exception as exc:
-                self.notify_flow(f"[图片] 打开失败: {exc}")
-                return
-            self._image_cache[path] = self.current_image
-            if len(self._image_cache) > self._cache_max:
-                self._image_cache.popitem(last=False)
+                self._loading_images.discard(path)
+                self._image_loading = False
+                self.root.after(0, lambda p=path, e=exc: self._skip_corrupted_image(p, str(e)))
 
+        self._image_loading = True
+        self._executor.submit(_load_image)
+
+    def _skip_corrupted_image(self, path: str, reason: str) -> None:
+        if path in self.image_paths:
+            idx = self.image_paths.index(path)
+            self.notify_flow(f"[跳过] 第{idx + 1}张图片无法加载")
+        else:
+            self.notify_flow(f"[跳过] 图片无法加载")
+        self.log_flow(f"[跳过] 图片损坏/无法打开: {path} — {reason}")
+        if path in self.image_paths:
+            idx = self.image_paths.index(path)
+            self.image_paths.pop(idx)
+            # 同步清理 dedupe 相关映射（如果存在）
+            if hasattr(self, 'dedupe_path_to_group') and path in self.dedupe_path_to_group:
+                g = self.dedupe_path_to_group.pop(path, None)
+                if hasattr(self, 'dedupe_groups') and g is not None and 1 <= g <= len(self.dedupe_groups):
+                    group = self.dedupe_groups[g - 1]
+                    if path in group:
+                        group.remove(path)
+                    if len(group) <= 1 and hasattr(self, 'dedupe_groups'):
+                        # 如果组内只剩一张，解散该组
+                        self.dedupe_groups.pop(g - 1)
+                        # 重建映射
+                        self.dedupe_path_to_group = {}
+                        self.dedupe_group_indices = []
+                        for gi, grp in enumerate(self.dedupe_groups, 1):
+                            for gp in grp:
+                                self.dedupe_path_to_group[gp] = gi
+                        self.dedupe_group_indices = [self.dedupe_path_to_group.get(p) for p in self.image_paths]
+                if hasattr(self, 'dedupe_selected') and path in self.dedupe_selected:
+                    self.dedupe_selected.pop(path, None)
+            # 调整索引
+            if self.current_index >= len(self.image_paths):
+                self.current_index = max(0, len(self.image_paths) - 1)
+            self._corrupted_skip_count = getattr(self, '_corrupted_skip_count', 0) + 1
+            if self._corrupted_skip_count > 5:
+                self.notify_flow("[跳过] 连续跳过超过5张图片，停止自动跳过")
+                self._corrupted_skip_count = 0
+                if 0 <= self.current_index < len(self.image_paths):
+                    self.show_current_image()
+                return
+            if 0 <= self.current_index < len(self.image_paths):
+                self.show_current_image()
+            else:
+                self.current_image = None
+                self.canvas.delete("all")
+                self.image_info_var.set("未加载图片")
+
+    def _on_image_loaded(self, path: str) -> None:
+        if path not in self._image_cache:
+            return
+        
+        self._corrupted_skip_count = 0
+        
+        if self.current_index < len(self.image_paths) and self.image_paths[self.current_index] == path:
+            self._image_cache.move_to_end(path)
+            self.current_image = self._image_cache[path]
+            self._render_current_image(path)
+            self._preload_surrounding()
+            self._schedule_pre_render()
+
+    def _render_current_image(self, path: str) -> None:
         try:
             size = Path(path).stat().st_size
         except OSError:
@@ -2095,63 +3335,279 @@ class TkImageBrowser:
             g_total = self.dedupe_group_indices.count(g)
             g_idx = self.dedupe_group_indices[:self.current_index + 1].count(g)
             group_info = f" 第{g}组 {g_idx}/{g_total}"
+        orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
         self.image_info_var.set(
             f"{self.current_index + 1}/{len(self.image_paths)}{group_info}  {Path(path).name}  "
-            f"{self.current_image.width}x{self.current_image.height}  {size / 1024:.1f} KB"
+            f"{orig_w}x{orig_h}  {size / 1024:.1f} KB"
         )
-        self.fit_image()
-        self._preload_next()
+        if hasattr(self, "_index_entry"):
+            self._index_entry.delete(0, "end")
+            self._index_entry.insert(0, f"{self.current_index + 1}")
+        if hasattr(self, "_total_label"):
+            self._total_label.config(text=f" / {len(self.image_paths)}")
+        if hasattr(self, "image_slider_scale") and len(self.image_paths) > 1:
+            self.image_slider_scale.set(self.current_index / max(len(self.image_paths) - 1, 1) * 1000)
+        if self._auto_fit.get():
+            self.fit_image()
+        else:
+            self.render_image()
+        self._preload_surrounding()
 
-    def prev_image(self) -> None:
-        if self.current_index > 0:
-            self.current_index -= 1
+    def _preload_surrounding(self, extend_range: int = 50) -> None:
+        total = len(self.image_paths)
+        if total <= 1:
+            return
+
+        preload_indices = []
+        for offset in range(extend_range + 1):
+            if offset == 0:
+                continue
+            idx_a = self.current_index - offset
+            idx_b = self.current_index + offset
+            if 0 <= idx_a < total:
+                preload_indices.append(idx_a)
+            if 0 <= idx_b < total:
+                preload_indices.append(idx_b)
+            if len(preload_indices) >= 100:
+                break
+
+        if not preload_indices:
+            return
+
+        target_w, target_h = self._get_preload_target_size()
+
+        def _load_single(idx: int) -> None:
+            path = self.image_paths[idx]
+            if path in self._image_cache or path in self._loading_images:
+                return
+            self._loading_images.add(path)
+            try:
+                with Image.open(path) as img:
+                    img.load()
+                    img_rgb = img.convert("RGB")
+                    img_w, img_h = img_rgb.size
+                    self._original_sizes[path] = (img_w, img_h)
+                    if img_w > target_w or img_h > target_h:
+                        ratio = min(target_w / img_w, target_h / img_h)
+                        new_w = int(img_w * ratio)
+                        new_h = int(img_h * ratio)
+                        img_copy = img_rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                    else:
+                        img_copy = img_rgb
+                if path not in self._image_cache:
+                    self._image_cache[path] = img_copy
+                    if len(self._image_cache) > self._cache_max:
+                        self._image_cache.popitem(last=False)
+                self._loading_images.discard(path)
+            except Exception:
+                self._loading_images.discard(path)
+
+        for i, idx in enumerate(preload_indices):
+            if i >= 4:
+                break
+            self._executor.submit(_load_single, idx)
+
+        remaining = preload_indices[4:]
+        if remaining:
+            def _load_remaining():
+                for idx in remaining:
+                    _load_single(idx)
+            self._executor.submit(_load_remaining)
+
+    def _get_preload_target_size(self) -> tuple[int, int]:
+        if self._cached_preload_size is not None:
+            return self._cached_preload_size
+        if self._auto_fit.get():
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw > 100 and ch > 100:
+                self._cached_preload_size = (cw, ch)
+                return self._cached_preload_size
+        self._cached_preload_size = (1920, 1080)
+        return self._cached_preload_size
+
+    def _schedule_pre_render(self) -> None:
+        if self._pre_render_after_id is not None:
+            self.root.after_cancel(self._pre_render_after_id)
+        self._pre_render_after_id = self.root.after_idle(self._pre_render_photo_images)
+
+    def _pre_render_photo_images(self) -> None:
+        self._pre_render_after_id = None
+        if not self._auto_fit.get() or not self.image_paths:
+            return
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 100 or ch <= 100:
+            return
+
+        rendered = 0
+        for offset in range(1, 25):
+            for idx in [self.current_index + offset, self.current_index - offset]:
+                if idx < 0 or idx >= len(self.image_paths):
+                    continue
+                path = self.image_paths[idx]
+                if path not in self._image_cache:
+                    continue
+                img = self._image_cache[path]
+                orig_w, orig_h = self._original_sizes.get(path, (img.width, img.height))
+                zoom = min(cw / orig_w, ch / orig_h, 1.0)
+                w = max(1, int(orig_w * zoom))
+                h = max(1, int(orig_h * zoom))
+                cache_key = f"{path}@{w}x{h}"
+                if cache_key in self._photo_cache:
+                    continue
+                try:
+                    display = img.resize((w, h), Image.Resampling.BILINEAR)
+                    photo = ImageTk.PhotoImage(display)
+                    self._photo_cache[cache_key] = photo
+                    if len(self._photo_cache) > self._photo_cache_max:
+                        oldest_key = next(iter(self._photo_cache))
+                        del self._photo_cache[oldest_key]
+                    rendered += 1
+                except Exception:
+                    pass
+                if rendered >= 3:
+                    break
+            if rendered >= 3:
+                break
+
+        if rendered >= 3:
+            self._pre_render_after_id = self.root.after(30, self._pre_render_photo_images)
+
+    def _on_image_scale_change(self, value: str) -> None:
+        if not self.image_paths:
+            return
+        total = len(self.image_paths)
+        if total <= 1:
+            return
+        target_index = int(float(value) / 1000 * (total - 1) + 0.5)
+        target_index = max(0, min(target_index, total - 1))
+        if target_index != self.current_index:
+            self.current_index = target_index
             if self._current_module == "dedupe":
                 self._focus_dedupe_image(self.image_paths[self.current_index])
             else:
                 self.show_current_image()
+            self._preload_surrounding()
+            self._schedule_pre_render()
+
+    def _on_global_index_enter(self, event: tk.Event) -> None:
+        try:
+            text = self._index_entry.get().strip()
+            idx = int(text) - 1
+            if self.image_paths:
+                total = len(self.image_paths)
+                if 0 <= idx < total and idx != self.current_index:
+                    self.current_index = idx
+                    self.show_current_image()
+                    self._preload_surrounding()
+                    self._schedule_pre_render()
+        except ValueError:
+            pass
+
+    def _on_canvas_click(self, event: tk.Event) -> None:
+        self.root.focus_set()
+
+    def _on_global_index_cancel(self, event: tk.Event) -> None:
+        pass
+
+    def _update_image_info(self) -> None:
+        if not self.image_paths:
+            return
+        path = self.image_paths[self.current_index]
+        self.image_info_var.set(f"{self.current_index + 1}/{len(self.image_paths)}  {Path(path).name}")
+        if hasattr(self, "_index_entry"):
+            self._index_entry.delete(0, "end")
+            self._index_entry.insert(0, f"{self.current_index + 1}")
+        if hasattr(self, "_total_label"):
+            self._total_label.config(text=f" / {len(self.image_paths)}")
+
+    def _on_image_slider_changed(self, value: int, max_val: float) -> None:
+        if not self.image_paths:
+            return
+        total = len(self.image_paths)
+        if total <= 1:
+            return
+        target_index = int((value / max_val) * (total - 1))
+        if 0 <= target_index < total and target_index != self.current_index:
+            self.current_index = target_index
+            if self._current_module == "dedupe":
+                self._focus_dedupe_image(self.image_paths[self.current_index])
+            else:
+                self.show_current_image()
+            self._preload_surrounding()
+            self._schedule_pre_render()
+
+    def prev_image(self) -> None:
+        if self.current_index > 0:
+            self._cancel_pending_load()
+            self.current_index -= 1
+            self._enter_fast_render_mode()
+            if self._current_module == "dedupe":
+                self._focus_dedupe_image(self.image_paths[self.current_index])
+            else:
+                self.show_current_image()
+            self._preload_surrounding()
+            self._schedule_pre_render()
             self._save_config()
 
     def next_image(self) -> None:
         if self.current_index < len(self.image_paths) - 1:
+            self._cancel_pending_load()
             self.current_index += 1
+            self._enter_fast_render_mode()
             if self._current_module == "dedupe":
                 self._focus_dedupe_image(self.image_paths[self.current_index])
             else:
                 self.show_current_image()
+            self._preload_surrounding()
+            self._schedule_pre_render()
             self._save_config()
 
-    def _preload_next(self) -> None:
-        next_idx = self.current_index + 1
-        if next_idx >= len(self.image_paths):
-            return
-        next_path = self.image_paths[next_idx]
-        if next_path in self._image_cache:
-            return
-        if self._preload_thread and self._preload_thread.is_alive():
-            return
+    def _enter_fast_render_mode(self) -> None:
+        self._fast_render = True
+        self._last_nav_time = time.time()
+        if self._quality_upgrade_after_id is not None:
+            self.root.after_cancel(self._quality_upgrade_after_id)
+            self._quality_upgrade_after_id = None
+        self._quality_upgrade_after_id = self.root.after(120, self._upgrade_render_quality)
 
-        def _preload():
-            try:
-                with Image.open(next_path) as img:
-                    img_copy = img.convert("RGB")
-                if next_path not in self._image_cache:
-                    self._image_cache[next_path] = img_copy
-                    if len(self._image_cache) > self._cache_max:
-                        self._image_cache.popitem(last=False)
-            except Exception:
-                pass
+    def _upgrade_render_quality(self) -> None:
+        self._quality_upgrade_after_id = None
+        if not self._fast_render:
+            return
+        self._fast_render = False
+        if 0 <= self.current_index < len(self.image_paths):
+            self.show_current_image()
 
-        self._preload_thread = threading.Thread(target=_preload, daemon=True)
-        self._preload_thread.start()
+    def _cancel_pending_load(self) -> None:
+        self._current_loading_path = ""
+
+    def _on_canvas_configure(self, _event: tk.Event | None = None) -> None:
+        if self._canvas_configure_after_id is not None:
+            self.root.after_cancel(self._canvas_configure_after_id)
+        self._canvas_configure_after_id = self.root.after(50, self._do_canvas_configure)
+
+    def _do_canvas_configure(self) -> None:
+        self._canvas_configure_after_id = None
+        self._cached_preload_size = None
+        self._photo_cache.clear()
+        if self._auto_fit.get():
+            self.fit_image()
+        else:
+            self.render_image()
+        self._schedule_pre_render()
 
     def fit_image(self) -> None:
         if not self.current_image:
             return
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
-        self.zoom = min(cw / self.current_image.width, ch / self.current_image.height, 1.0)
-        self.pan_x = (cw - self.current_image.width * self.zoom) / 2
-        self.pan_y = (ch - self.current_image.height * self.zoom) / 2
+        path = self.image_paths[self.current_index] if self.current_index < len(self.image_paths) else ""
+        orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
+        self.zoom = min(cw / orig_w, ch / orig_h, 1.0)
+        self.pan_x = (cw - orig_w * self.zoom) / 2
+        self.pan_y = (ch - orig_h * self.zoom) / 2
         self.render_image()
 
     def refresh_current_labels(self, update_list: bool = False) -> None:
@@ -2170,8 +3626,8 @@ class TkImageBrowser:
                 self.set_busy(f"图片刷新失败: {exc}", 100)
                 self.log_label(f"图片刷新失败: {exc}")
                 return
-            self.set_busy("[标签] 请先在标签显示中选择标签目录", 100)
-            self.log_label("请先选择标签目录")
+            self.set_busy("[标签] 标签目录未选择", 100)
+            self.log_label("未选择标签目录")
             return
         self.set_busy("[标签] 正在重绘当前图片标签...", 45)
         self.labels_imported = True
@@ -2189,25 +3645,43 @@ class TkImageBrowser:
         self.set_busy(f"[标签] 已刷新：当前图片 {label_count} 个标注", 100)
 
     def render_image(self) -> int:
-        self.canvas.delete("all")
         if not self.current_image:
+            self._clear_canvas_items()
             return 0
-        w = max(1, int(self.current_image.width * self.zoom))
-        h = max(1, int(self.current_image.height * self.zoom))
-        try:
-            display = self.current_image.resize((w, h), Image.Resampling.LANCZOS)
-        except Exception as exc:
-            self.notify_flow(f"[图片] 渲染失败: {exc}")
-            return 0
-        self.tk_image = ImageTk.PhotoImage(display)
-        self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_image)
+
+        path = self.image_paths[self.current_index] if self.current_index < len(self.image_paths) else ""
+        orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
+        w = max(1, int(orig_w * self.zoom))
+        h = max(1, int(orig_h * self.zoom))
+        cache_key = f"{path}@{w}x{h}"
+
+        if cache_key in self._photo_cache:
+            self.tk_image = self._photo_cache[cache_key]
+        else:
+            resample = Image.Resampling.BILINEAR if self._fast_render else Image.Resampling.LANCZOS
+            try:
+                if self.current_image.width == w and self.current_image.height == h:
+                    display = self.current_image
+                else:
+                    display = self.current_image.resize((w, h), resample)
+            except Exception as exc:
+                self.notify_flow(f"[图片] 渲染失败: {exc}")
+                return 0
+            self.tk_image = ImageTk.PhotoImage(display)
+            self._photo_cache[cache_key] = self.tk_image
+            if len(self._photo_cache) > self._photo_cache_max:
+                oldest_key = next(iter(self._photo_cache))
+                del self._photo_cache[oldest_key]
+
+        self._update_canvas_image()
+
         labels: list[LabelShape] = []
         if self.labels_visible.get() and self.labels_imported and 0 <= self.current_index < len(self.image_paths):
             before = tuple(self.label_store.classes)
             try:
-                labels = self.label_store.load_for_image(
+                labels = self._load_labels_cached(
                     self.image_paths[self.current_index],
-                    (self.current_image.width, self.current_image.height),
+                    (orig_w, orig_h),
                 )
             except Exception as exc:
                 self.notify_flow(f"[标签] 读取失败: {exc}")
@@ -2217,33 +3691,93 @@ class TkImageBrowser:
             self._draw_labels(labels)
         return len(labels)
 
+    def _clear_canvas_items(self) -> None:
+        if self._canvas_image_id is not None:
+            try:
+                self.canvas.delete(self._canvas_image_id)
+            except tk.TclError:
+                pass
+            self._canvas_image_id = None
+        for lid in self._canvas_label_ids:
+            try:
+                self.canvas.delete(lid)
+            except tk.TclError:
+                pass
+        self._canvas_label_ids = []
+        for lid in self._canvas_label_text_ids:
+            try:
+                self.canvas.delete(lid)
+            except tk.TclError:
+                pass
+        self._canvas_label_text_ids = []
+
+    def _update_canvas_image(self) -> None:
+        if self._canvas_image_id is not None:
+            try:
+                self.canvas.coords(self._canvas_image_id, self.pan_x, self.pan_y)
+                self.canvas.itemconfigure(self._canvas_image_id, image=self.tk_image)
+                return
+            except tk.TclError:
+                self._canvas_image_id = None
+        self._canvas_image_id = self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_image)
+
+    def _load_labels_cached(self, path: str, size: tuple[int, int]) -> list[LabelShape]:
+        cache_key = path
+        if cache_key in self._label_cache:
+            return self._label_cache[cache_key]
+        labels = self.label_store.load_for_image(path, size)
+        if len(self._label_cache) >= self._label_cache_max:
+            oldest_key = next(iter(self._label_cache))
+            del self._label_cache[oldest_key]
+        self._label_cache[cache_key] = labels
+        return labels
+
     def _draw_labels(self, labels: list[LabelShape]) -> None:
         if not self.current_image:
             return
+        for lid in self._canvas_label_ids:
+            try:
+                self.canvas.delete(lid)
+            except tk.TclError:
+                pass
+        for lid in self._canvas_label_text_ids:
+            try:
+                self.canvas.delete(lid)
+            except tk.TclError:
+                pass
+        self._canvas_label_ids = []
+        self._canvas_label_text_ids = []
+        path = self.image_paths[self.current_index] if self.current_index < len(self.image_paths) else ""
+        orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
         palette = ["#ff5252", "#00bcd4", "#ffc107", "#4caf50", "#e040fb", "#ff9800", "#40c4ff"]
         for label in labels:
             color = palette[label.class_id % len(palette)]
             coords: list[float] = []
             for x, y in label.points:
                 coords.extend([
-                    self.pan_x + x * self.current_image.width * self.zoom,
-                    self.pan_y + y * self.current_image.height * self.zoom,
+                    self.pan_x + x * orig_w * self.zoom,
+                    self.pan_y + y * orig_h * self.zoom,
                 ])
             if len(coords) < 6:
                 continue
             fill = color if label.kind in {"segment", "obb", "detect"} else ""
-            self.canvas.create_polygon(coords, outline=color, fill=fill, stipple="gray25", width=2)
-            self.canvas.create_line(coords + coords[:2], fill=color, width=2)
+            poly_id = self.canvas.create_polygon(coords, outline=color, fill=fill, stipple="gray25", width=2)
+            self._canvas_label_ids.append(poly_id)
+            line_id = self.canvas.create_line(coords + coords[:2], fill=color, width=2)
+            self._canvas_label_ids.append(line_id)
             for i in range(0, len(coords), 2):
                 x0, y0 = coords[i], coords[i + 1]
-                self.canvas.create_oval(x0 - 3, y0 - 3, x0 + 3, y0 + 3, outline=color, fill="#ffffff", width=1)
+                oval_id = self.canvas.create_oval(x0 - 3, y0 - 3, x0 + 3, y0 + 3, outline=color, fill="#ffffff", width=1)
+                self._canvas_label_ids.append(oval_id)
             text = label.class_name + (f" {label.confidence:.2f}" if label.confidence else "")
             text_x = min(coords[0::2])
             text_y = max(12, min(coords[1::2]) - 16)
             text_id = self.canvas.create_text(text_x + 4, text_y, text=text, anchor="nw", fill="#ffffff", font=("Arial", 11, "bold"))
+            self._canvas_label_text_ids.append(text_id)
             bbox = self.canvas.bbox(text_id)
             if bbox:
                 bg = self.canvas.create_rectangle(bbox[0] - 3, bbox[1] - 2, bbox[2] + 3, bbox[3] + 2, fill=color, outline=color)
+                self._canvas_label_ids.append(bg)
                 self.canvas.tag_lower(bg, text_id)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
@@ -2285,6 +3819,7 @@ class TkImageBrowser:
                 self.log_label("已取消选择标签目录，建议先导入 classes.txt")
                 return
         self.label_store.clear_label_cache()
+        self._label_cache.clear()
         self.log_label(f"已选择标签目录: {path}")
         self.label_dir_var.set(path)
         self.log_label("开始导入标签目录")
@@ -2293,6 +3828,7 @@ class TkImageBrowser:
 
     def on_label_setting_changed(self) -> None:
         self.label_store.clear_label_cache()
+        self._label_cache.clear()
         self.log_label("标签格式设置已更改")
         self._save_config()
         self.toggle_label_visibility()
@@ -2304,11 +3840,11 @@ class TkImageBrowser:
                 self.select_coco_path(self.coco_file_var.get())
             else:
                 self.log_label("未选择 JSON 文件")
-                messagebox.showinfo("提示", "请先选择 COCO JSON")
+                messagebox.showinfo("提示", "未选择 COCO JSON")
             return
         if not self.label_dir_var.get():
             self.log_label("未选择标签目录")
-            messagebox.showinfo("提示", "请先选择标签目录")
+            messagebox.showinfo("提示", "未选择标签目录")
             return
         if not self.label_store.classes:
             if not messagebox.askyesno(
@@ -2331,6 +3867,7 @@ class TkImageBrowser:
 
     def _load_classes_from_path(self, path: str, render: bool = True) -> None:
         self.label_store.clear_label_cache()
+        self._label_cache.clear()
         self.log_label(f"正在导入类别文件: {path}")
         self.label_store.load_classes(path)
         self._sync_class_filter()
@@ -2346,6 +3883,7 @@ class TkImageBrowser:
 
     def select_coco_path(self, path: str) -> None:
         self.label_store.clear_label_cache()
+        self._label_cache.clear()
         try:
             self.set_busy("[COCO] 正在导入 JSON...", 5)
             self.log_label(f"正在导入 COCO JSON: {path}")
@@ -2442,8 +3980,8 @@ class TkImageBrowser:
 
     def move_current_image(self) -> None:
         if not self.move_target_var.get() or not (0 <= self.current_index < len(self.image_paths)):
-            self.notify_flow("[转移] 请先选择图片和目标目录")
-            messagebox.showwarning("提示", "请先选择图片和目标目录")
+            self.notify_flow("[转移] 未选择图片或目标目录")
+            messagebox.showwarning("提示", "未选择图片或目标目录")
             return
         src = self.image_paths[self.current_index]
         ok, lbl, err = move_with_labels(src, self.move_target_var.get(), self.dir_var.get(), self.label_dir_var.get(), self.keep_structure.get())
@@ -2537,9 +4075,20 @@ class TkImageBrowser:
                 if not (self.gpu_acceleration.get() and self._gpu_available):
                     self.task_queue.put(("dedupe_status", (task_id, f"[错误] 相似去重任务{task_id}: GPU特征算法需要顶部启用GPU加速")))
                     return
-                groups = self._find_similarity_gpu_feature_worker(paths, color_thresh, task_id, stop_event)
+                task = next((t for t in self.dedupe_tasks if t.task_id == task_id), None)
+                if task:
+                    color_w = task._color_weight.get()
+                    texture_w = task._texture_weight.get()
+                    shape_w = task._shape_weight.get()
+                    threshold = task._similarity_threshold.get() / 100.0
+                    precision = task._precision_mode.get()
+                else:
+                    color_w, texture_w, shape_w = 0.40, 0.30, 0.30
+                    threshold = 0.75
+                    precision = "balanced"
+                groups = self._find_similarity_gpu_feature_worker(paths, color_thresh, task_id, stop_event, color_w, texture_w, shape_w, threshold, precision)
                 if stop_event.is_set() or groups is None:
-                    self.task_queue.put(("dedupe_status", (task_id, f"[宸插仠姝 鐩镐技鍘婚噸浠诲姟{task_id}")))
+                    self.task_queue.put(("dedupe_status", (task_id, f"[已停止] 相似去重任务{task_id}")))
                     return
                 self.task_queue.put(("dedupe_groups", (task_id, folder, groups)))
                 self.task_queue.put(("dedupe_status", (task_id, f"[完成] 相似去重任务{task_id}: GPU特征扫描完成 {len(groups)} 组")))
@@ -2586,7 +4135,7 @@ class TkImageBrowser:
         except Exception as exc:
             self.task_queue.put(("dedupe_status", (task_id, f"[错误] 相似去重任务{task_id}: {exc}")))
 
-    def _find_similarity_gpu_feature_worker(self, paths: list[str], similarity_value: float, task_id: int, stop_event: threading.Event) -> list[list[str]] | None:
+    def _find_similarity_gpu_feature_worker(self, paths: list[str], similarity_value: float, task_id: int, stop_event: threading.Event, color_weight: float = 0.40, texture_weight: float = 0.30, shape_weight: float = 0.30, threshold: float = 0.75, precision: str = "balanced") -> list[list[str]] | None:
         try:
             import torch
             import torch.nn.functional as F
@@ -2599,71 +4148,302 @@ class TkImageBrowser:
             self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 显存总量: {gpu_memory:.2f} GB")))
             resample = getattr(Image, "Resampling", Image).BILINEAR
             workers = self._dedupe_worker_count(io_bound=True)
-            batch_size = 256 if self.performance_mode.get() else 128
-            embeddings: list[torch.Tensor] = []
+
+            # 动态显存检测和安全调整
+            gpu_total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            gpu_allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
+            # 降低安全缓冲到10%，因为有OOM保护兜底
+            gpu_available_gb = gpu_total_memory_gb - gpu_allocated_gb - (gpu_total_memory_gb * 0.1)
+            
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 总显存:{gpu_total_memory_gb:.1f}GB 已用:{gpu_allocated_gb:.1f}GB 可用:{gpu_available_gb:.1f}GB")))
+
+            # 根据GPU显存大小动态调整倍数（提高各档位倍数以充分利用GPU）
+            if gpu_total_memory_gb >= 8:
+                # 8GB以上高端显卡：激进策略
+                batch_multiplier = 2.0
+                chunk_multiplier = 2.0
+                self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 检测到高端GPU({gpu_total_memory_gb:.1f}GB)，使用激进优化策略")))
+            elif gpu_total_memory_gb >= 5.5:
+                # 5.5-8GB中端显卡（如RTX 3060 6GB）：平衡+
+                batch_multiplier = 1.5
+                chunk_multiplier = 1.5
+                self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 检测到中端GPU({gpu_total_memory_gb:.1f}GB)，使用平衡优化策略")))
+            elif gpu_total_memory_gb >= 3.5:
+                # 3.5-5.5GB入门显卡：保守策略
+                batch_multiplier = 1.3
+                chunk_multiplier = 1.3
+                self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 检测到入门GPU({gpu_total_memory_gb:.1f}GB)，使用保守优化策略")))
+            else:
+                # 3.5GB以下：安全策略
+                batch_multiplier = 1.1
+                chunk_multiplier = 1.1
+                self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 检测到小显存GPU({gpu_total_memory_gb:.1f}GB)，使用安全优化策略")))
+
+            if precision == "fast":
+                batch_size = int(512 * batch_multiplier)  # 动态基础值512
+                img_size = 192  # 提升分辨率增加GPU计算量
+                feat_size = 24
+            elif precision == "precise":
+                batch_size = int(128 * batch_multiplier)   # 动态基础值128
+                img_size = 384  # 更高分辨率
+                feat_size = 48
+            else:
+                batch_size = int(256 * batch_multiplier)   # 动态基础值256
+                img_size = 256  # 从128提升到256，GPU计算量4倍
+                feat_size = 32  # 更大的特征尺寸
+            
+            # 确保batch_size不超过显存限制（粗略估算）
+            # 每张图片约需 img_size * img_size * 3 * 4 bytes (float32)
+            max_batch_by_memory = int(gpu_available_gb * 1024**3 / (img_size * img_size * 3 * 4 * 1.2))  # 1.2x安全系数(OOM保护兜底)
+            batch_size = min(batch_size, max_batch_by_memory, 1024)  # 硬上限1024
+            batch_size = max(batch_size, 64)  # 硬下限64
+            
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 动态调整后 batch_size={batch_size} (显卡适配倍数:{batch_multiplier:.1f})")))
+
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU多特征融合] 颜色:{color_weight:.0%} 纹理:{texture_weight:.0%} 形状:{shape_weight:.0%} 阈值:{threshold:.0%}")))
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 精度模式:{precision} 读取线程:{workers} 批次大小:{batch_size} 图片尺寸:{img_size}")))
+
+            color_embeddings: list[torch.Tensor] = []
+            texture_embeddings: list[torch.Tensor] = []
+            shape_embeddings: list[torch.Tensor] = []
             valid_paths: list[str] = []
-            threshold = max(0.78, min(0.98, 0.82 + similarity_value * 0.15))
-            self.task_queue.put(("dedupe_status", (task_id, f"[GPU特征] 模式启动，阈值 {threshold:.2f}，读取线程 {workers}，批次大小 {batch_size}")))
 
             def load_rgb(path: str) -> tuple[str, np.ndarray] | None:
                 if stop_event.is_set():
                     return None
                 try:
-                    with Image.open(path) as img:
-                        img.draft("RGB", (256, 256))
-                        img = img.convert("RGB").resize((128, 128), resample)
-                        return path, np.asarray(img, dtype=np.uint8).copy()
+                    # 优先使用 cv2（快10-20倍），回退 PIL
+                    if cv2 is not None:
+                        # cv2.imread 不支持中文路径，用 imdecode 绕过
+                        arr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if arr is None:
+                            return None
+                        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                        arr = cv2.resize(arr, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+                        return path, arr
+                    else:
+                        with Image.open(path) as img:
+                            img = img.convert("RGB")
+                            img = img.resize((img_size, img_size), Image.BILINEAR)
+                            arr = np.array(img, dtype=np.uint8)
+                            if arr.shape == (img_size, img_size, 3):
+                                return path, arr
+                            arr = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+                            temp = img.resize((img_size, img_size), Image.NEAREST)
+                            arr[:temp.height, :temp.width] = np.array(temp)
+                            return path, arr
                 except Exception:
                     return None
 
-            def embed_batch(batch: list[tuple[str, np.ndarray]]) -> None:
+            def embed_batch(batch: list[tuple[str, np.ndarray]], retry_depth: int = 0) -> None:
                 if not batch:
                     return
-                arr = np.stack([item[1] for item in batch])
-                tensor = torch.as_tensor(arr, device=device, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
-                small = F.interpolate(tensor, size=(16, 16), mode="bilinear", align_corners=False)
-                gray = small.mean(dim=1, keepdim=True)
-                gx = gray[:, :, :, 1:] - gray[:, :, :, :-1]
-                gy = gray[:, :, 1:, :] - gray[:, :, :-1, :]
-                color_stats = torch.cat(
-                    [
-                        tensor.mean(dim=(2, 3)),
-                        tensor.std(dim=(2, 3)),
-                        gx.abs().mean(dim=(2, 3)),
-                        gy.abs().mean(dim=(2, 3)),
-                    ],
-                    dim=1,
-                )
-                vec = torch.cat([small.flatten(1), color_stats], dim=1)
-                vec = F.normalize(vec, dim=1)
-                embeddings.append(vec.detach().cpu())
-                valid_paths.extend(item[0] for item in batch)
-                if len(valid_paths) % 200 == 0:
-                    mem_used = torch.cuda.memory_allocated(0) / 1024**3
-                    self.task_queue.put(("dedupe_status", (task_id, f"[GPU特征提取] {len(valid_paths)} 张，GPU显存 {mem_used:.2f} GB")))
+                if retry_depth > 3:
+                    self.task_queue.put(("dedupe_status", (task_id, f"[错误] 批次处理失败，已达最大重试次数")))
+                    return
+                
+                try:
+                    paths = []
+                    arrs = []
+                    for p, a in batch:
+                        if a.shape == (img_size, img_size, 3):
+                            arrs.append(a)
+                            paths.append(p)
+                        else:
+                            fixed = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+                            h, w = min(a.shape[0], img_size), min(a.shape[1], img_size)
+                            if a.ndim == 2:
+                                fixed[:h, :w, 0] = a[:h, :w]
+                                fixed[:h, :w, 1] = a[:h, :w]
+                                fixed[:h, :w, 2] = a[:h, :w]
+                            elif a.shape[2] >= 3:
+                                fixed[:h, :w] = a[:h, :w, :3]
+                            arrs.append(fixed)
+                            paths.append(p)
 
+                    if len(arrs) != len(batch):
+                        skipped = len(batch) - len(arrs)
+                        self.task_queue.put(("dedupe_status", (task_id, f"[警告] 修复了 {skipped} 张尺寸不正确的图片")))
+
+                    if not arrs:
+                        return
+
+                    arr = np.stack(arrs)
+                    tensor = torch.as_tensor(arr, device=device, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
+                    B, C, H, W = tensor.shape
+                    
+                    # ====== 网格分区特征（核心：捕捉局部变化，区分物体移动 vs 真正重复）======
+                    grid_size = 4  # 4x4 网格
+                    gh, gw = H // grid_size, W // grid_size
+                    # 用 reshape 切分：[B, C, H, W] → [B, C, grid, gh, grid, gw] → [B, grid*grid, C, gh, gw]
+                    patches = tensor.reshape(B, C, grid_size, gh, grid_size, gw)
+                    patches = patches.permute(0, 2, 4, 1, 3, 5).reshape(B, grid_size * grid_size, C, gh, gw)
+                    
+                    # 每个格子的颜色均值 + std → [B, 16, 6]
+                    patch_color_mean = patches.mean(dim=(3, 4))  # [B, 16, 3]
+                    patch_color_std = patches.std(dim=(3, 4))    # [B, 16, 3]
+                    patch_color = torch.cat([patch_color_mean, patch_color_std], dim=2)  # [B, 16, 6]
+                    patch_color = F.normalize(patch_color.flatten(1), dim=1)  # [B, 96]
+                    
+                    # 每个格子的纹理（梯度）→ [B, 16, 2]
+                    patch_gray = patches.mean(dim=2, keepdim=True)  # [B, 16, 1, gh, gw]
+                    pgx = (patch_gray[:, :, :, :, 1:] - patch_gray[:, :, :, :, :-1]).abs().mean(dim=(3, 4))  # [B, 16, 1]
+                    pgy = (patch_gray[:, :, :, 1:, :] - patch_gray[:, :, :, :-1, :]).abs().mean(dim=(3, 4))  # [B, 16, 1]
+                    patch_texture = torch.stack([pgx.squeeze(2), pgy.squeeze(2)], dim=2)  # [B, 16, 2]
+                    patch_texture = F.normalize(patch_texture.flatten(1), dim=1)  # [B, 32]
+                    
+                    # 每个格子的边缘强度 → [B, 16]
+                    pedge_x = patches[:, :, :, :, 1:] - patches[:, :, :, :, :-1]  # [B, 16, C, gh, gw-1]
+                    pedge_y = patches[:, :, :, 1:, :] - patches[:, :, :, :-1, :]  # [B, 16, C, gh-1, gw]
+                    ch = min(pedge_x.shape[3], pedge_y.shape[3])
+                    cw = min(pedge_x.shape[4], pedge_y.shape[4])
+                    pedge = torch.sqrt(pedge_x[:, :, :, :ch, :cw] ** 2 + pedge_y[:, :, :, :ch, :cw] ** 2 + 1e-6)
+                    patch_edge = pedge.mean(dim=(2, 3, 4))  # [B, 16] 对 C, gh, gw 三个维度取均值
+                    patch_edge = F.normalize(patch_edge, dim=1)  # [B, 16]
+                    
+                    # 合并网格特征
+                    color_feat = patch_color  # [B, 96]
+                    texture_feat = patch_texture  # [B, 32]
+                    shape_feat = patch_edge  # [B, 16]
+                    
+                    # ====== 全局特征辅助（小权重） ======
+                    small = F.interpolate(tensor, size=(feat_size, feat_size), mode="bilinear", align_corners=False)
+                    global_color = F.normalize(tensor.mean(dim=(2, 3)), dim=1)  # [B, 3]
+                    gray = small.mean(dim=1, keepdim=True)
+                    global_texture = F.normalize(torch.cat([
+                        (gray[:, :, :, 1:] - gray[:, :, :, :-1]).abs().mean(dim=(2, 3)),
+                        (gray[:, :, 1:, :] - gray[:, :, :-1, :]).abs().mean(dim=(2, 3)),
+                    ], dim=1), dim=1)  # [B, 2]
+                    global_shape = F.normalize(small.flatten(1), dim=1)  # [B, feat_size*feat_size]
+                    
+                    # 融合：网格特征为主(80%) + 全局特征为辅(20%)
+                    color_feat = F.normalize(torch.cat([color_feat, global_color], dim=1), dim=1)
+                    texture_feat = F.normalize(torch.cat([texture_feat, global_texture], dim=1), dim=1)
+                    shape_feat = F.normalize(torch.cat([shape_feat, global_shape], dim=1), dim=1)
+                    
+                    color_embeddings.append(color_feat.detach().cpu())
+                    texture_embeddings.append(texture_feat.detach().cpu())
+                    shape_embeddings.append(shape_feat.detach().cpu())
+
+                    valid_paths.extend(paths)
+                    
+                    # 每个batch后清理GPU中间张量
+                    del tensor, small, gray, patches, patch_gray
+                    del pgx, pgy, pedge_x, pedge_y, pedge, global_color, global_texture, global_shape
+                    torch.cuda.empty_cache()
+                except torch.cuda.OutOfMemoryError as oom_error:
+                    # OOM错误：显存不足，需要减小batch_size并重试
+                    self.task_queue.put(("dedupe_status", (task_id, f"[OOM] 显存不足，自动减小批次大小并重试")))
+                    torch.cuda.empty_cache()  # 清理显存
+                    
+                    # 将batch分成两半递归处理
+                    if len(batch) > 1:
+                        mid = len(batch) // 2
+                        self.task_queue.put(("dedupe_status", (task_id, f"[OOM] 将批次 {len(batch)} 拆分为 {mid} + {len(batch)-mid}")))
+                        embed_batch(batch[:mid], retry_depth + 1)
+                        embed_batch(batch[mid:], retry_depth + 1)
+                    else:
+                        self.task_queue.put(("dedupe_status", (task_id, f"[OOM] 单张图片显存不足，跳过: {batch[0][0] if batch else 'unknown'}")))
+                    return
+                except Exception as e:
+                    self.task_queue.put(("dedupe_status", (task_id, f"[错误] 批次处理失败: {e}")))
+                    return
+
+                if len(valid_paths) % 200 == 0:
+                    mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                    mem_percent = (mem_allocated / mem_total) * 100
+                    self.task_queue.put(("dedupe_status", (task_id, f"[GPU特征提取] {len(valid_paths)}张 | 已分配:{mem_allocated:.2f}GB | 保留:{mem_reserved:.2f}GB | 使用率:{mem_percent:.1f}%")))
+
+            # 生产者-消费者流水线：CPU预加载 + GPU计算并行
+            # 使用 queue 让加载线程持续工作，GPU处理时不阻塞加载
+            from queue import Queue as ThreadQueue
+            data_queue: ThreadQueue = ThreadQueue(maxsize=min(batch_size * 3, 2048))
+            load_done = threading.Event()
+            
+            def producer():
+                """后台线程持续加载图片，放入队列"""
+                try:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        for i, item in enumerate(executor.map(load_rgb, paths), 1):
+                            if stop_event.is_set():
+                                break
+                            if item is not None:
+                                data_queue.put(item)
+                            # 避免进度更新阻塞生产者
+                            if i % 100 == 0 or i == len(paths):
+                                self.task_queue.put(("dedupe_progress", (task_id, i / max(len(paths), 1) * 45)))
+                finally:
+                    load_done.set()
+            
+            loader_thread = threading.Thread(target=producer, daemon=True)
+            loader_thread.start()
+            
             batch: list[tuple[str, np.ndarray]] = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                for i, item in enumerate(executor.map(load_rgb, paths), 1):
-                    if stop_event.is_set():
-                        return None
-                    if item is not None:
-                        batch.append(item)
-                    if len(batch) >= batch_size:
+            total_loaded = 0
+            while not (load_done.is_set() and data_queue.empty()):
+                if stop_event.is_set():
+                    return None
+                try:
+                    item = data_queue.get(timeout=0.5)
+                    batch.append(item)
+                    total_loaded += 1
+                    # 累积到 batch_size 的 1.5 倍再处理，让数据更充分
+                    if len(batch) >= int(batch_size * 1.5) or (load_done.is_set() and len(batch) >= 32):
                         embed_batch(batch)
                         batch.clear()
-                    if i % 50 == 0 or i == len(paths):
-                        self.task_queue.put(("dedupe_progress", (task_id, i / max(len(paths), 1) * 45)))
+                except Exception:
+                    # queue empty timeout, 检查是否加载完成
+                    if load_done.is_set() and not batch:
+                        break
+                    # 如果加载中但队列空，处理已有数据
+                    if batch and (load_done.is_set() or len(batch) >= batch_size):
+                        embed_batch(batch)
+                        batch.clear()
+            # 处理剩余数据
+            if batch:
                 embed_batch(batch)
+                batch.clear()
 
             if len(valid_paths) < 2:
                 return []
-            matrix = torch.cat(embeddings, dim=0).to(device)
-            n = matrix.shape[0]
-            chunk = 1024 if self.performance_mode.get() else 512
+
+            if not (len(color_embeddings) == len(texture_embeddings) == len(shape_embeddings) == len(valid_paths)):
+                self.task_queue.put(("dedupe_status", (task_id, f"[错误] 特征数量不一致: 颜色{len(color_embeddings)} 纹理{len(texture_embeddings)} 形状{len(shape_embeddings)} 路径{len(valid_paths)}")))
+                return None
+
+            try:
+                color_matrix = torch.cat(color_embeddings, dim=0).to(device)
+                texture_matrix = torch.cat(texture_embeddings, dim=0).to(device)
+                shape_matrix = torch.cat(shape_embeddings, dim=0).to(device)
+            except Exception as e:
+                self.task_queue.put(("dedupe_status", (task_id, f"[错误] GPU特征矩阵构建失败: {e}")))
+                return None
+
+            n = color_matrix.shape[0]
+            if n != texture_matrix.shape[0] or n != shape_matrix.shape[0]:
+                self.task_queue.put(("dedupe_status", (task_id, f"[错误] 特征矩阵维度不一致: 颜色{color_matrix.shape[0]} 纹理{texture_matrix.shape[0]} 形状{shape_matrix.shape[0]}")))
+                return None
+
+            # 动态chunk大小，根据GPU显存和精度模式调整
+            base_chunk = 2048 if precision == "fast" else (1024 if precision == "balanced" else 512)
+            chunk = int(base_chunk * chunk_multiplier)
+            
+            # 根据显存限制调整chunk（避免OOM）
+            # 估算：chunk * n * 3 * 4 bytes (3个特征矩阵，float32)
+            if n > 0:
+                max_chunk_by_memory = int(gpu_available_gb * 1024**3 / (n * 3 * 4 * 1.2))  # 1.2x安全系数(OOM保护兜底)
+                chunk = min(chunk, max_chunk_by_memory, 4096)  # 硬上限4096
+                chunk = max(chunk, 256)  # 硬下限256
+            
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 动态调整后 chunk={chunk} (基础:{base_chunk}, 倍数:{chunk_multiplier:.1f})")))
             parent = list(range(n))
-            mem_used = torch.cuda.memory_allocated(0) / 1024**3
-            self.task_queue.put(("dedupe_status", (task_id, f"[GPU] 特征矩阵已加载 {n}x{n}，GPU显存 {mem_used:.2f} GB")))
+            mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+            mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            mem_percent = (mem_allocated / mem_total) * 100
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU相似度计算] 矩阵{n}x{n} | 已分配:{mem_allocated:.2f}GB | 保留:{mem_reserved:.2f}GB | 使用率:{mem_percent:.1f}%")))
 
             def find_idx(x: int) -> int:
                 while parent[x] != x:
@@ -2676,13 +4456,19 @@ class TkImageBrowser:
                 if ra != rb:
                     parent[ra] = rb
 
-            self.task_queue.put(("dedupe_status", (task_id, f"[GPU相似度计算] 矩阵乘法，分块大小 {chunk}")))
+            self.task_queue.put(("dedupe_status", (task_id, f"[GPU多特征相似度计算] 加权融合，分块大小 {chunk}")))
             for start in range(0, n, chunk):
                 if stop_event.is_set():
                     return None
                 end = min(start + chunk, n)
-                sims = matrix[start:end] @ matrix.T
-                rows, cols = torch.nonzero(sims >= threshold, as_tuple=True)
+
+                color_sim = color_matrix[start:end] @ color_matrix.T
+                texture_sim = texture_matrix[start:end] @ texture_matrix.T
+                shape_sim = shape_matrix[start:end] @ shape_matrix.T
+
+                fused_sim = color_weight * color_sim + texture_weight * texture_sim + shape_weight * shape_sim
+
+                rows, cols = torch.nonzero(fused_sim >= threshold, as_tuple=True)
                 if len(rows):
                     rows_np = (rows + start).detach().cpu().numpy()
                     cols_np = cols.detach().cpu().numpy()
@@ -2692,6 +4478,15 @@ class TkImageBrowser:
                 progress = 45 + int(end / max(n, 1) * 50)
                 self.task_queue.put(("dedupe_status", (task_id, f"[GPU矩阵乘法] {end}/{n} ({progress}%)")))
                 self.task_queue.put(("dedupe_progress", (task_id, progress)))
+                
+                # 定期输出显存使用情况（每4个chunk输出一次）
+                if (start // chunk) % 4 == 0 or end >= n:
+                    mem_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                    mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                    mem_percent = (mem_allocated / mem_total) * 100
+                    self.task_queue.put(("dedupe_status", (task_id, 
+                        f"[GPU显存] 已分配:{mem_allocated:.2f}GB | 保留:{mem_reserved:.2f}GB | 使用率:{mem_percent:.1f}%")))
 
             buckets: dict[int, list[str]] = defaultdict(list)
             for idx, path in enumerate(valid_paths):
@@ -2709,7 +4504,7 @@ class TkImageBrowser:
             device = torch.device("cuda")
             resample = getattr(Image, "Resampling", Image).BILINEAR
             workers = self._dedupe_worker_count(io_bound=True)
-            batch_size = 512 if self.performance_mode.get() else 256
+            batch_size = 1024 if self.performance_mode.get() else 512  # 提高batch以充分利用GPU
             features: list[ImageFeature] = []
             self.task_queue.put(("dedupe_status", (task_id, f"[相似去重任务{task_id}] GPU特征提取，读取线程 {workers}")))
 
@@ -3219,7 +5014,7 @@ class TkImageBrowser:
     def preview_selected_duplicates(self) -> None:
         selected = [path for path, var in self.dedupe_selected.items() if var.get()]
         if not selected:
-            self.notify_flow("[相似去重] 请先勾选要预览的图片")
+            self.notify_flow("[相似去重] 未勾选要预览的图片")
             return
         for i, path in enumerate(self.image_paths):
             if path in selected:
@@ -3259,7 +5054,7 @@ class TkImageBrowser:
     def _dedupe_transfer_and_next(self) -> None:
         selected = [p for p, v in self.dedupe_selected.items() if v.get()]
         if not selected:
-            self.dedupe_status_var.set("[相似去重] 请先勾选要转移的图片")
+            self.dedupe_status_var.set("[相似去重] 未勾选要转移的图片")
             return
         self._transfer_selected_duplicates()
         self.root.after(100, self.next_image)
@@ -3277,8 +5072,8 @@ class TkImageBrowser:
     def move_selected_duplicates(self) -> None:
         selected = [path for path, var in self.dedupe_selected.items() if var.get()]
         if not selected:
-            self.notify_flow("[相似去重] 请先勾选要转移的相似图片")
-            messagebox.showinfo("提示", "请先勾选要转移的相似图片")
+            self.notify_flow("[相似去重] 未勾选要转移的相似图片")
+            messagebox.showinfo("提示", "未勾选要转移的相似图片")
             return
         target = filedialog.askdirectory(title="选择相似图片转移目标目录")
         if not target:
@@ -3371,6 +5166,9 @@ class TkImageBrowser:
                     if scan_id == self._label_scan_id:
                         msg = f"[标签] 后台匹配 {current}/{total}，可继续操作"
                         self._update_module_status("labels", msg, current / max(total, 1) * 100)
+                        if hasattr(self, "label_progress_var"):
+                            self.label_progress_var.set(current / max(total, 1) * 100)
+                            self.label_progress_text.config(text=f"{current}/{total}")
                         if current == 1 or current == total or current % 500 == 0:
                             self._append_module_log("labels", msg, show=self._current_module == "labels")
                             self.log_label(f"后台匹配进度 {current}/{total}")
@@ -3382,6 +5180,8 @@ class TkImageBrowser:
                             self.label_tree.insert("", "end", iid=str(idx), values=(status, image_name, label_info))
                         self.log_label(f"后台匹配完成：{matched}/{total} 张图片已导入标签")
                         self._update_module_status("labels", f"[标签] 后台匹配完成：{matched}/{total} 张图片已导入标签", 100, log=True)
+                        if hasattr(self, "label_progress_frame"):
+                            self.label_progress_frame.pack_forget()
                 elif kind == "reload":
                     if self.dir_var.get() and Path(self.dir_var.get()).exists():
                         self.load_image_dir(self.dir_var.get())
@@ -3398,6 +5198,8 @@ class TkImageBrowser:
 
     def _on_close(self) -> None:
         self._save_config()
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=False)
         self.root.destroy()
 
 
