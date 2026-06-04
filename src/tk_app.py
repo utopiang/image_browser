@@ -8,9 +8,9 @@ import threading
 import time
 from collections import defaultdict, OrderedDict
 
-VERSION = "v1.0.5"
+VERSION = "v1.0.6"
 AUTHOR = "zhw"
-UPDATE_DATE = "2026-05-29"
+UPDATE_DATE = "2026-06-04"
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, Future, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from functools import lru_cache
@@ -34,6 +34,21 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".mpeg", ".mpg"}
 CONFIG_DIR = Path.home() / ".image_browser"
 CONFIG_PATH = CONFIG_DIR / "tk_config.json"
 THUMB_SIZE = (150, 110)
+
+def get_dpi_scale() -> float:
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        dpi = root.winfo_fpixels("1i")
+        root.destroy()
+        return dpi / 96.0
+    except Exception:
+        return 1.0
+
+DPI_SCALE = get_dpi_scale()
+
+def scale_font_size(size: int) -> int:
+    return max(7, round(size * DPI_SCALE))
 
 
 @dataclass
@@ -1243,6 +1258,120 @@ class VideoExtractTask:
             return False
 
     def _extract_single(self, video: Path, root: Path, out_dir: str, interval_mode: str, interval_value: float, compress: int, base_progress: float, progress_span: float) -> int:
+        use_gpu = self._can_use_gpu_for_extract()
+        if use_gpu:
+            return self._extract_single_gpu(video, root, out_dir, interval_mode, interval_value, compress, base_progress, progress_span)
+        else:
+            return self._extract_single_cpu(video, root, out_dir, interval_mode, interval_value, compress, base_progress, progress_span)
+
+    def _can_use_gpu_for_extract(self) -> bool:
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
+
+    def _extract_single_gpu(self, video: Path, root: Path, out_dir: str, interval_mode: str, interval_value: float, compress: int, base_progress: float, progress_span: float) -> int:
+        try:
+            import torch
+        except ImportError:
+            return self._extract_single_cpu(video, root, out_dir, interval_mode, interval_value, compress, base_progress, progress_span)
+        if not torch.cuda.is_available():
+            return self._extract_single_cpu(video, root, out_dir, interval_mode, interval_value, compress, base_progress, progress_span)
+
+        cap = cv2.VideoCapture(str(video))
+        if not cap.isOpened():
+            return 0
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        step = max(1, int(round(interval_value * fps))) if interval_mode == "seconds" else max(1, int(round(interval_value)))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        dst_dir = Path(out_dir)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        device = torch.device("cuda")
+        submitted = written = 0
+        write_workers = self._video_write_workers()
+        pending: set[Future] = set()
+        batch_size = 16
+        batch_frames: list[np.ndarray] = []
+        batch_indices: list[int] = []
+
+        def collect_finished(block: bool = False) -> None:
+            nonlocal written, pending
+            if not pending:
+                return
+            done: set[Future]
+            if block:
+                done, pending = wait(pending)
+            else:
+                done, pending = wait(pending, timeout=0, return_when=FIRST_COMPLETED)
+            for future in done:
+                written += int(bool(future.result()))
+
+        def flush_batch() -> None:
+            nonlocal batch_frames, batch_indices, pending, submitted
+            if not batch_frames:
+                return
+            try:
+                arr = np.stack(batch_frames, axis=0)
+                tensor = torch.from_numpy(arr).to(device, non_blocking=True)
+                tensor = tensor[:, :, :, [2, 1, 0]]
+                for i, frame_tensor in enumerate(tensor):
+                    frame_np = frame_tensor.cpu().numpy()
+                    out_path = dst_dir / f"{video.stem}_f{batch_indices[i]:06d}.png"
+                    pending.add(writer.submit(self._write_png, out_path, frame_np, compress))
+                    submitted += 1
+            except Exception as e:
+                self._emit(f"[GPU抽帧] 批处理失败，回退CPU处理: {e}", base_progress)
+                for i, frame in enumerate(batch_frames):
+                    out_path = dst_dir / f"{video.stem}_f{batch_indices[i]:06d}.png"
+                    pending.add(writer.submit(self._write_png, out_path, frame, compress))
+                    submitted += 1
+            finally:
+                batch_frames.clear()
+                batch_indices.clear()
+            torch.cuda.empty_cache()
+
+        with ThreadPoolExecutor(max_workers=write_workers) as writer:
+            idx = 0
+            while total_frames <= 0 or idx < total_frames:
+                if self._stop_event.is_set():
+                    break
+                while self._is_paused and not self._stop_event.is_set():
+                    self._pause_event.wait(timeout=0.1)
+                if self._stop_event.is_set():
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                if idx % step == 0:
+                    batch_frames.append(frame)
+                    batch_indices.append(idx)
+                    if len(batch_frames) >= batch_size:
+                        flush_batch()
+
+                if len(pending) >= write_workers * 3:
+                    collect_finished(block=False)
+                if len(pending) >= write_workers * 4:
+                    collect_finished(block=True)
+
+                idx += 1
+                if idx % 50 == 0 or (total_frames > 0 and idx >= total_frames):
+                    collect_finished(block=False)
+                    progress = base_progress + min(1.0, idx / max(total_frames, 1)) * progress_span
+                    self._emit(f"{video.name} [GPU] 抽帧中 {min(idx, total_frames)}/{total_frames}", progress)
+
+            flush_batch()
+            collect_finished(block=True)
+
+        cap.release()
+        torch.cuda.empty_cache()
+        return written
+
+    def _extract_single_cpu(self, video: Path, root: Path, out_dir: str, interval_mode: str, interval_value: float, compress: int, base_progress: float, progress_span: float) -> int:
         cap = cv2.VideoCapture(str(video))
         if not cap.isOpened():
             return 0
@@ -1270,11 +1399,18 @@ class VideoExtractTask:
             for future in done:
                 written += int(bool(future.result()))
 
+        def wait_if_paused() -> bool:
+            while self._is_paused and not self._stop_event.is_set():
+                self._pause_event.wait(timeout=0.05)
+            return self._stop_event.is_set()
+
         with ThreadPoolExecutor(max_workers=write_workers) as writer:
             while total_frames <= 0 or idx < total_frames:
                 if self._stop_event.is_set():
                     break
-                ok, frame = self._read_valid_frame(cap)
+                if wait_if_paused():
+                    break
+                ok, frame = cap.read()
                 if not ok:
                     break
 
@@ -1304,8 +1440,10 @@ class VideoExtractTask:
         cap.release()
         return written
 
-    def update_status(self, msg: str) -> None:
+    def update_status(self, msg: str, progress: float | None = None) -> None:
         self.status_var.set(msg)
+        if progress is not None and self.progress_bar is not None:
+            self.progress_bar["value"] = progress
 
 
 class SimilarDedupeTask:
@@ -1979,15 +2117,15 @@ class TkImageBrowser:
         self._max_log_entries = 200
 
         style = ttk.Style(self.root)
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("Nav.TButton", anchor="w", padding=(10, 8))
-        style.configure("Active.Nav.TButton", anchor="w", padding=(10, 8))
-        style.configure("Hint.TLabel", font=("Microsoft YaHei UI", 8), foreground="gray")
-        style.configure("Compact.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7))
-        style.configure("Action.TButton", padding=(6, 3), font=("Microsoft YaHei UI", 8), background="#3b82f6")
-        style.configure("Danger.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7), foreground="#ef4444")
-        style.configure("Accent.TButton", padding=(4, 2), font=("Microsoft YaHei UI", 7), foreground="#8b5cf6")
-        style.configure("CompactTask.TLabelframe", font=("Microsoft YaHei UI", 8))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", scale_font_size(10), "bold"))
+        style.configure("Nav.TButton", anchor="w", padding=(round(10 * DPI_SCALE), round(8 * DPI_SCALE)))
+        style.configure("Active.Nav.TButton", anchor="w", padding=(round(10 * DPI_SCALE), round(8 * DPI_SCALE)))
+        style.configure("Hint.TLabel", font=("Microsoft YaHei UI", scale_font_size(8)), foreground="gray")
+        style.configure("Compact.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)))
+        style.configure("Action.TButton", padding=(round(6 * DPI_SCALE), round(3 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(8)), background="#3b82f6")
+        style.configure("Danger.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)), foreground="#ef4444")
+        style.configure("Accent.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)), foreground="#8b5cf6")
+        style.configure("CompactTask.TLabelframe", font=("Microsoft YaHei UI", scale_font_size(8)))
         self.root.bind_all("<KeyPress>", self._on_keypress)
 
         main = ttk.Frame(self.root, padding=6)
@@ -2414,11 +2552,6 @@ class TkImageBrowser:
         self.mark_transfer_preview = tk.Text(tab, height=3, state="disabled", bg="#f6f7f9", font=("Microsoft YaHei UI", 7))
         self.mark_transfer_preview.pack(fill="x", pady=(6, 4))
 
-        btn_row = ttk.Frame(tab)
-        btn_row.pack(fill="x", pady=4)
-        ttk.Button(btn_row, text="转移当前图片", command=self.move_current_image_with_confirm).pack(side="left", fill="x", expand=True)
-        ttk.Button(btn_row, text="全选待转移", command=self.select_all_marked_for_transfer).pack(side="left", fill="x", expand=True, padx=(4, 0))
-
         ttk.Label(tab, text="按标记类别批量转移", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(6, 0))
         self.batch_category_var = StringVar()
         self.batch_category_combo = ttk.Combobox(tab, textvariable=self.batch_category_var, state="readonly")
@@ -2427,53 +2560,14 @@ class TkImageBrowser:
         batch_row = ttk.Frame(tab)
         batch_row.pack(fill="x")
         ttk.Button(batch_row, text="执行批量转移", command=self.move_marked_images_with_confirm).pack(side="left", fill="x", expand=True)
-        ttk.Button(batch_row, text="预览文件", command=self.preview_marked_files).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         self.marked_count_var = StringVar(value="待转移: 0 张")
-        ttk.Label(tab, textvariable=self.marked_count_var, font=("Microsoft YaHei UI", 8), foreground="#64748b").pack(anchor="w", pady=(4, 0))
-
-        ttk.Separator(tab).pack(fill="x", pady=6)
-
-        delete_frame = ttk.LabelFrame(tab, text="原始文件删除队列", padding=4)
-        delete_frame.pack(fill="x")
-        self.delete_queue_var = StringVar(value="待删除: 0 个文件")
-        ttk.Label(delete_frame, textvariable=self.delete_queue_var, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
-        self.delete_queue_list = tk.Listbox(delete_frame, height=2, font=("Microsoft YaHei UI", 7))
-        self.delete_queue_list.pack(fill="x", pady=4)
-        btn_del = ttk.Frame(delete_frame)
-        btn_del.pack(fill="x")
-        ttk.Button(btn_del, text="添加到删除队列", command=self.add_to_delete_queue).pack(side="left", fill="x", expand=True)
-        ttk.Button(btn_del, text="执行删除", command=self.execute_delete_queue).pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Button(btn_del, text="清空队列", command=self.clear_delete_queue).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Label(tab, textvariable=self.marked_count_var, font=("Microsoft YaHei UI", scale_font_size(8)), foreground="#64748b").pack(anchor="w", pady=(4, 0))
 
         self.refresh_mark_buttons()
-        self._delete_queue: list[str] = []
         self._marked_images: list[str] = []
         self._current_mark_index = 0
-
-    def select_all_marked_for_transfer(self) -> None:
-        if not hasattr(self, "_marked_images") or not self._marked_images:
-            self._load_marked_images()
-        if hasattr(self, "_marked_images") and self._marked_images:
-            for path in self._marked_images:
-                if path not in self._selected_for_transfer:
-                    self._selected_for_transfer.add(path)
-            self._update_mark_transfer_preview()
-
-    def preview_marked_files(self) -> None:
-        self._load_marked_images()
-        if not hasattr(self, "_marked_images") or not self._marked_images:
-            messagebox.showinfo("提示", "没有找到待转移的图片")
-            return
-        preview_text = f"待转移图片 ({len(self._marked_images)} 张):\n"
-        for i, path in enumerate(self._marked_images[:20]):
-            preview_text += f"  {i+1}. {Path(path).name}\n"
-        if len(self._marked_images) > 20:
-            preview_text += f"  ... 还有 {len(self._marked_images) - 20} 张\n"
-        self.mark_transfer_preview.config(state="normal")
-        self.mark_transfer_preview.delete("1.0", "end")
-        self.mark_transfer_preview.insert("1.0", preview_text)
-        self.mark_transfer_preview.config(state="disabled")
+        self._total_marked_count = 0
 
     def _load_marked_images(self) -> None:
         category = self.batch_category_var.get()
@@ -2484,6 +2578,7 @@ class TkImageBrowser:
             self._marked_images = []
             return
         paths: set[str] = set()
+        all_lines: dict[Path, list[str]] = {}
         root = Path(self.dir_var.get()) if self.dir_var.get() else Path(".")
         try:
             mark_files = list(root.rglob(f"{category}.txt")) if self.recursive.get() else list((Path(self.dir_var.get()) if self.dir_var.get() else Path(".")).glob(f"{category}.txt"))
@@ -2492,13 +2587,68 @@ class TkImageBrowser:
         for mark_path in mark_files:
             try:
                 with open(mark_path, "r", encoding="utf-8") as f:
-                    paths.update(line.strip() for line in f if line.strip())
+                    lines = [line.strip() for line in f if line.strip()]
+                all_lines[mark_path] = lines
+                paths.update(lines)
             except OSError:
                 continue
-        self._marked_images = sorted(paths)
+        existing = {p for p in paths if Path(p).exists()}
+        missing = paths - existing
+        if missing:
+            for mark_path, lines in all_lines.items():
+                new_lines = [line for line in lines if line in existing]
+                if len(new_lines) != len(lines):
+                    try:
+                        with open(mark_path, "w", encoding="utf-8") as f:
+                            f.write("\n".join(new_lines) + ("\n" if new_lines else ""))
+                    except OSError:
+                        continue
+            self.notify_flow(f"[标记] 已从 {category} 列表中清理 {len(missing)} 张不存在的图片")
+        self._marked_images = sorted(existing)
         self._selected_for_transfer = set(self._marked_images)
-        self.mark_slider.set_range(0, max(len(self._marked_images) - 1, 1))
         self.marked_count_var.set(f"待转移: {len(self._marked_images)} 张")
+        self._total_marked_count = len(self._marked_images)
+        if hasattr(self, "_mark_count_label"):
+            self._mark_count_label.config(text=f"待转移: {len(self._marked_images)} 张")
+        if hasattr(self, "_marked_count_var2"):
+            self._marked_count_var2.set(str(len(self._marked_images)))
+        if hasattr(self, "_transfer_count_var"):
+            self._transfer_count_var.set(str(len(self._marked_images)))
+
+    def _update_mark_count_display(self, delta: int = 0) -> None:
+        self._total_marked_count = max(0, self._total_marked_count + delta)
+        if hasattr(self, "_marked_count_var2"):
+            self._marked_count_var2.set(str(self._total_marked_count))
+        if hasattr(self, "_mark_count_label"):
+            self._mark_count_label.config(text=f"待转移: {self._total_marked_count} 张")
+        if hasattr(self, "_transfer_count_var"):
+            self._transfer_count_var.set(str(self._total_marked_count))
+
+    def _refresh_mark_count_from_files(self) -> None:
+        total_marked = 0
+        root = Path(self.dir_var.get()) if self.dir_var.get() else Path(".")
+        cats = self._categories()
+        for cat in cats:
+            try:
+                if self.recursive.get():
+                    mark_files = list(root.rglob(f"{cat}.txt"))
+                else:
+                    mark_files = list(root.glob(f"{cat}.txt"))
+                for mark_path in mark_files:
+                    try:
+                        with open(mark_path, "r", encoding="utf-8") as f:
+                            total_marked += len([line.strip() for line in f if line.strip()])
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        self._total_marked_count = total_marked
+        if hasattr(self, "_marked_count_var2"):
+            self._marked_count_var2.set(str(total_marked))
+        if hasattr(self, "_mark_count_label"):
+            self._mark_count_label.config(text=f"待转移: {total_marked} 张")
+        if hasattr(self, "_transfer_count_var"):
+            self._transfer_count_var.set(str(total_marked))
 
     def _update_mark_transfer_preview(self) -> None:
         if not hasattr(self, "_marked_images"):
@@ -2516,30 +2666,6 @@ class TkImageBrowser:
         self.mark_transfer_preview.insert("1.0", preview_text)
         self.mark_transfer_preview.config(state="disabled")
 
-    def move_current_image_with_confirm(self) -> None:
-        if not (0 <= self.current_index < len(self.image_paths)):
-            self.notify_flow("[转移] 未选择图片")
-            messagebox.showwarning("提示", "请先选择图片")
-            return
-        src = self.image_paths[self.current_index]
-        result = messagebox.askyesnocancel(
-            "确认转移",
-            f"确定要转移当前图片吗？\n\n文件: {Path(src).name}\n路径: {src}",
-            parent=self.root
-        )
-        if result is None:
-            return
-        if result:
-            ok, lbl, err = move_with_labels(src, self.move_target_var.get(), self.dir_var.get(), self.label_dir_var.get(), self.keep_structure.get())
-            if not ok:
-                self.notify_flow(f"[转移] 移动失败: {err}")
-                messagebox.showerror("移动失败", err)
-                return
-            self.image_paths.pop(self.current_index)
-            self.current_index = min(self.current_index, len(self.image_paths) - 1)
-            self.notify_flow(f"[转移] 已移动当前图片，同步标签 {lbl} 个")
-            self.show_current_image()
-
     def move_marked_images_with_confirm(self) -> None:
         self._load_marked_images()
         category = self.batch_category_var.get()
@@ -2551,6 +2677,15 @@ class TkImageBrowser:
         if not hasattr(self, "_marked_images") or not self._marked_images:
             self.notify_flow("[批量转移] 没有找到该分类的标记图片")
             messagebox.showinfo("提示", "没有找到该分类的标记图片")
+            self.marked_count_var.set("待转移: 0 张")
+            if hasattr(self, "_mark_count_label"):
+                self._mark_count_label.config(text="待转移: 0 张")
+            if hasattr(self, "_marked_count_var2"):
+                self._marked_count_var2.set("0")
+            if hasattr(self, "_transfer_count_var"):
+                self._transfer_count_var.set("0")
+            self._total_marked_count = 0
+            self._update_mark_transfer_preview()
             return
         paths = list(getattr(self, "_selected_for_transfer", set()))
         if not paths:
@@ -2560,44 +2695,43 @@ class TkImageBrowser:
         if result is None:
             return
         if result:
-            self._run_thread(self._move_many_worker, paths, target, self.dir_var.get(), self.label_dir_var.get(), "批量转移完成")
+            self._run_thread(self._move_many_worker, paths, target, self.dir_var.get(), self.label_dir_var.get(), category, "批量转移完成")
 
-    def add_to_delete_queue(self) -> None:
-        if not (0 <= self.current_index < len(self.image_paths)):
-            messagebox.showinfo("提示", "未选择要删除的图片")
-            return
-        path = self.image_paths[self.current_index]
-        if path not in self._delete_queue:
-            self._delete_queue.append(path)
-            self.delete_queue_list.insert("end", Path(path).name)
-            self.delete_queue_var.set(f"待删除: {len(self._delete_queue)} 个文件")
-
-    def execute_delete_queue(self) -> None:
-        if not self._delete_queue:
-            messagebox.showinfo("提示", "删除队列为空")
-            return
-        confirm_msg = f"确定要删除以下 {len(self._delete_queue)} 个文件吗？\n\n此操作不可恢复！"
-        result = messagebox.askyesno("确认删除", confirm_msg, parent=self.root)
-        if not result:
-            return
-        success = fail = 0
-        for path in list(self._delete_queue):
-            try:
-                Path(path).unlink()
-                self._delete_queue.remove(path)
-                self.delete_queue_list.delete(0)
-                success += 1
-            except Exception as e:
-                fail += 1
-                self._append_module_log("marks", f"[删除] 删除失败: {path} - {e}")
-        self.delete_queue_var.set(f"待删除: {len(self._delete_queue)} 个文件")
-        self.notify_flow(f"[删除] 完成: 成功 {success}，失败 {fail}")
-        self._save_config()
-
-    def clear_delete_queue(self) -> None:
-        self._delete_queue.clear()
-        self.delete_queue_list.delete(0, "end")
-        self.delete_queue_var.set(f"待删除: 0 个文件")
+    def _cleanup_after_move(self, moved_paths: list[str], category: str, missing_paths: list[str] | None = None) -> None:
+        """清理转移后的状态：从已选列表和标记文件中移除已转移图片，更新计数。"""
+        missing_paths = missing_paths or []
+        moved_set = set(moved_paths)
+        missing_set = set(missing_paths)
+        if hasattr(self, "_selected_for_transfer"):
+            self._selected_for_transfer -= moved_set
+            self._selected_for_transfer -= missing_set
+        if hasattr(self, "_marked_images"):
+            self._marked_images = [p for p in self._marked_images if p not in moved_set and p not in missing_set]
+        try:
+            root = Path(self.dir_var.get()) if self.dir_var.get() else Path(".")
+            if self.recursive.get():
+                mark_files = list(root.rglob(f"{category}.txt"))
+            else:
+                mark_files = list(root.glob(f"{category}.txt"))
+            for mark_path in mark_files:
+                try:
+                    with open(mark_path, "r", encoding="utf-8") as f:
+                        lines = [line.strip() for line in f if line.strip()]
+                    new_lines = [line for line in lines if line not in moved_set and line not in missing_set]
+                    if len(new_lines) != len(lines):
+                        with open(mark_path, "w", encoding="utf-8") as f:
+                            f.write("\n".join(new_lines) + ("\n" if new_lines else ""))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        self._refresh_mark_count_from_files()
+        self._update_mark_transfer_preview()
+        self.marked_count_var.set(f"待转移: {len(self._marked_images)} 张")
+        msg = f"[批量转移] 已清理 {len(moved_paths)} 张已转移图片的标记记录"
+        if missing_paths:
+            msg += f"，{len(missing_paths)} 张图片不存在已自动跳过"
+        self.notify_flow(msg)
 
     def _build_video_panel(self) -> None:
         tab = self._register_panel("video")
@@ -2861,6 +2995,7 @@ class TkImageBrowser:
     def _restore_last_directory(self) -> None:
         dir_path = self.dir_var.get()
         if not dir_path:
+            self._refresh_mark_count_from_files()
             return
         last_index = self.config.get("last_index", 0)
         self.notify_flow(f"[启动] 正在恢复上次目录: {dir_path}")
@@ -2869,8 +3004,18 @@ class TkImageBrowser:
             if 0 < last_index < len(self.image_paths):
                 self.current_index = last_index - 1
                 self.show_current_image()
+            self.refresh_current_labels()
+            self._refresh_mark_count_from_files()
+            if hasattr(self, "batch_category_combo") and self._categories():
+                self.batch_category_combo.set(self._categories()[0])
+                self._load_marked_images()
+            self._update_mark_transfer_preview()
             self.notify_flow(f"[启动] 已恢复任务，当前位置: 第 {last_index} 张图片")
         else:
+            self.config["last_dir"] = ""
+            self.config["last_index"] = 0
+            self._save_config()
+            self._refresh_mark_count_from_files()
             self.notify_flow(f"[启动] 上次目录不存在: {dir_path}")
 
     def _categories(self) -> list[str]:
@@ -3218,6 +3363,11 @@ class TkImageBrowser:
         if same_dir and 0 <= last_index < len(self.image_paths):
             self.current_index = last_index
         self.show_current_image()
+        self._refresh_mark_count_from_files()
+        if hasattr(self, "batch_category_combo") and self._categories():
+            self.batch_category_combo.set(self._categories()[0])
+            self._load_marked_images()
+        self._update_mark_transfer_preview()
         self.set_busy(f"[图片] 加载完成：{len(self.image_paths)} 张", 100)
 
     def show_current_image(self) -> None:
@@ -3954,12 +4104,15 @@ class TkImageBrowser:
             except OSError as exc:
                 self.notify_flow(f"[标记] 读取标记文件失败: {exc}")
                 return
-        if path in lines:
+        was_marked = path in lines
+        if was_marked:
             lines = [line for line in lines if line != path]
             action = "取消标记"
+            delta = -1
         else:
             lines.append(path)
             action = "已标记"
+            delta = 1
         try:
             with open(mark_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + ("\n" if lines else ""))
@@ -3967,8 +4120,10 @@ class TkImageBrowser:
             self.notify_flow(f"[标记] 写入标记文件失败: {exc}")
             return
         self.notify_flow(f"[标记] {action}: {category}")
+        self._update_mark_count_display(delta)
 
-        if category == "漏检" and path in lines and self.current_index < len(self.image_paths) - 1:
+        auto_next_categories = ["漏检", "误检", "used", "unused"]
+        if category in auto_next_categories and not was_marked and self.current_index < len(self.image_paths) - 1:
             self.current_index += 1
             self.show_current_image()
             self._save_config()
@@ -4019,20 +4174,32 @@ class TkImageBrowser:
             self.notify_flow("[批量转移] 没有找到该分类的标记图片")
             messagebox.showinfo("提示", "没有找到该分类的标记图片")
             return
-        self._run_thread(self._move_many_worker, paths, target, self.dir_var.get(), self.label_dir_var.get(), "批量转移完成")
+        self._run_thread(self._move_many_worker, paths, target, self.dir_var.get(), self.label_dir_var.get(), category, "批量转移完成")
 
-    def _move_many_worker(self, paths: list[str], target: str, root: str, label_dir: str, done_msg: str) -> None:
-        success = fail = labels = 0
+    def _move_many_worker(self, paths: list[str], target: str, root: str, label_dir: str, category: str, done_msg: str) -> None:
+        success = fail = labels = skipped = 0
         total = len(paths)
+        moved_paths: list[str] = []
+        missing_paths: list[str] = []
         for i, path in enumerate(paths, 1):
+            if not Path(path).exists():
+                missing_paths.append(path)
+                skipped += 1
+                if i % 50 == 0 or i == total:
+                    self.task_queue.put(("move_status", f"[转移] {i}/{total}（跳过{skipped}）"))
+                continue
             ok, lbl, _err = move_with_labels(path, target, root, label_dir, True)
-            success += int(ok)
-            fail += int(not ok)
+            if ok:
+                success += 1
+                moved_paths.append(path)
+            else:
+                fail += 1
             labels += lbl
             if i % 50 == 0 or i == total:
                 self.task_queue.put(("move_status", f"[转移] {i}/{total}"))
-        self.task_queue.put(("move_status", f"[完成] {done_msg}: 图片 {success}，标签 {labels}，失败 {fail}"))
-        self.task_queue.put(("reload", None))
+        msg = f"[完成] {done_msg}: 图片 {success}，标签 {labels}，失败 {fail}，跳过 {skipped}"
+        self.task_queue.put(("move_status", msg))
+        self.task_queue.put(("reload", (moved_paths, category, missing_paths)))
 
     def start_find_similarity(self, task_id: int = 1, folder: str | None = None, phash_thresh: int | None = None, color_thresh: float | None = None, algorithm: str = "phash") -> None:
         folder = folder or self.dedupe_dir_var.get()
@@ -5183,8 +5350,17 @@ class TkImageBrowser:
                         if hasattr(self, "label_progress_frame"):
                             self.label_progress_frame.pack_forget()
                 elif kind == "reload":
+                    if isinstance(payload, tuple) and len(payload) == 3:
+                        moved_paths, moved_category, missing_paths = payload
+                    elif isinstance(payload, tuple) and len(payload) == 2:
+                        moved_paths, moved_category = payload
+                        missing_paths = []
+                    else:
+                        moved_paths, moved_category, missing_paths = None, None, []
                     if self.dir_var.get() and Path(self.dir_var.get()).exists():
                         self.load_image_dir(self.dir_var.get())
+                    if moved_paths and moved_category:
+                        self._cleanup_after_move(moved_paths, moved_category, missing_paths)
                 elif kind == "image_paths":
                     paths = payload
                     self._image_cache.clear()
