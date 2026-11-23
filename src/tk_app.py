@@ -3847,6 +3847,19 @@ class TkImageBrowser:
         export_menu.add_command(label="批量导出全部标签（YOLO）…", command=self.export_all_labels)
         export_menu.add_command(label="导出类别文件（classes.txt）…", command=self.export_classes)
 
+        # ---- 视图：模块直达入口（与左侧 Tab 同 command，保证入口统一） ----
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="视图", menu=view_menu)
+        for i, (key, title) in enumerate([
+            ("browse", "数据浏览"),
+            ("labels", "标签显示"),
+            ("marks", "标记转移"),
+            ("video", "视频抽帧"),
+            ("dedupe", "相似去重"),
+        ], start=1):
+            view_menu.add_command(label=f"转到 {title}", accelerator=f"Ctrl+{i}",
+                                  command=lambda k=key: self.show_panel(k))
+
         # ---- 设置 ----
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="设置", menu=settings_menu)
@@ -3969,6 +3982,9 @@ class TkImageBrowser:
         # X-AnyLabeling 风格快捷键：Ctrl+O 打开目录、Ctrl+S 保存标签
         self.root.bind("<Control-o>", lambda _e: (self.open_image_dir(), "break")[1])
         self.root.bind("<Control-s>", lambda _e: (self._save_current_labels(force=True), "break")[1])
+        # Ctrl+1~5 模块直达，与「视图」菜单项一一对应
+        for _i, _key in enumerate(["browse", "labels", "marks", "video", "dedupe"], start=1):
+            self.root.bind(f"<Control-{_i}>", lambda _e, k=_key: self.show_panel(k))
 
         main = ttk.Frame(self.root, padding=6)
         main.pack(fill="both", expand=True)
