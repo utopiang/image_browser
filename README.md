@@ -1,8 +1,8 @@
-# 图片筛选工具 (Image Browser)
+﻿# 图片筛选工具 (Image Browser)
 
 一款基于 Tkinter 的轻量级图片浏览与数据集筛选工具，支持图片预览、缩放拖动、YOLO 标签可视化、分类标记、批量复制/移动、视频抽帧（decord 引擎）、相似图片去重（CPU pHash + 颜色直方图）等功能。
 
-> 当前版本：**v1.0.21**（CPU-only）
+> 当前版本：**v1.0.22**（CPU-only）
 > 自 v1.0.20 起已完全移除 GPU/CUDA/torch 依赖，去重改为纯 CPU 的 pHash + 颜色直方图，视频抽帧统一使用 decord 引擎，并精简了打包体积。
 
 ## 功能特性
