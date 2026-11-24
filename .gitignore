@@ -18,6 +18,7 @@ env/
 .vscode/
 
 .claude/
+.trae/
 
 requirements.md
 temp.md

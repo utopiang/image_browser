@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -18,9 +19,9 @@ import traceback
 from collections import defaultdict, OrderedDict
 from logging.handlers import RotatingFileHandler
 
-VERSION = "v1.0.22"
+VERSION = "v1.0.24"
 AUTHOR = "zhw"
-UPDATE_DATE = "2026-11-23"
+UPDATE_DATE = "2026-11-24"
 
 # ============ 日志子系统 ============
 # 目的：打包后的 exe（windowed 模式无控制台）也能在 logs/ 目录留下运行日志，
@@ -164,35 +165,33 @@ TUTORIAL_STEPS = [
         "target": None,
     },
     {
-        "title": "① 顶部导航栏",
+        "title": "① 三个工作入口",
         "content": (
-            "顶部 Tab 栏可切换不同功能模块：\n"
-            "  • 数据浏览：浏览图片文件夹\n"
-            "  • 标签显示：自动识别 YOLO/COCO/LabelMe 标签\n"
-            "  • 标记转移：批量移动/复制选中的图片\n"
+            "顶部只保留三个主入口：\n"
+            "  • 图片工作台：打开目录即预览，在右侧检查标签或分类整理\n"
             "  • 视频抽帧：从视频中按时间间隔抽取帧\n"
             "  • 相似去重：识别并清理相似/重复图片"
         ),
         "target": "nav",
     },
     {
-        "title": "② 顶部工具栏",
+        "title": "② 图片工作台布局",
         "content": (
-            "顶部右侧提供：\n"
-            "  • 适应窗口 / 显示标签 / 最大性能：浏览相关选项\n"
-            "  • 下一步：随时重新打开新手引导（首次启动时高亮）\n"
-            "  • 帮助：查看完整教程与操作说明\n"
-            "  • 关于：查看软件介绍和版本日志"
+            "左侧：打开文件夹、最近目录、搜索与图片列表。\n"
+            "中间：图片预览，上一张 / 下一张、适应窗口与编辑框开关。\n"
+            "右侧：概览 / 标签检查 / 分类整理，共用当前图片。\n\n"
+            "标签默认只读浏览，开启「编辑框」后可修改 YOLO 检测框。\n"
+            "操作日志默认收起，可从底部展开；教程在「帮助」菜单中。"
         ),
         "target": "toolbar",
     },
     {
-        "title": "③ 数据浏览（核心功能）",
+        "title": "③ 浏览与编辑",
         "content": (
-            "在「数据浏览」模块中：\n"
+            "在「图片工作台」中：\n"
             "  • 快捷键 A / D：上一张 / 下一张\n"
-            "  • 快捷键 W / S：上一行 / 下一行（十张）\n"
-            "  • Space：标记当前图片\n"
+            "  • Ctrl+F：按文件名搜索，回车打开首个结果\n"
+            "  • Space：下一张；分类标记请在右侧「分类整理」中操作\n"
             "  • 鼠标滚轮：缩放图片\n"
             "  • 快捷键 F：适应窗口显示"
         ),
@@ -304,6 +303,20 @@ import tkinter as tk
 from tkinter import ttk
 
 from PIL import Image, ImageTk
+try:
+    from .workspace import WorkspaceMixin
+    from .annotation_editor import AnnotationEditorMixin
+    from .annotation_workflow import AnnotationWorkflowMixin
+    from .ui_icons import IconFactory
+    from .annotation_formats import (LabelShape, AnnotationError, atomic_json, read_labelme,
+        labelme_document, coco_shapes, shapes_to_coco, update_coco_image, convert_shape)
+except ImportError:  # 兼容直接从 src 导入 tk_app 的脚本
+    from workspace import WorkspaceMixin
+    from annotation_editor import AnnotationEditorMixin
+    from annotation_workflow import AnnotationWorkflowMixin
+    from ui_icons import IconFactory
+    from annotation_formats import (LabelShape, AnnotationError, atomic_json, read_labelme,
+        labelme_document, coco_shapes, shapes_to_coco, update_coco_image, convert_shape)
 
 try:
     import cv2
@@ -952,36 +965,21 @@ def resolve_gt_save_path(image_path: str | Path, label_root: str | Path | None =
 
 
 def shapes_to_yolo_lines(shapes: list) -> list[str]:
-    """把 LabelShape 列表转为归一化 YOLO 文本行。
-
-    detect: class cx cy w h（4 位角点转中心点宽高，6 位小数）
-    obb:    class x1 y1 ... x4 y4（8 值）
-    segment: class x1 y1 ...（多点）
-    坐标统一钳制到 [0, 1]。
-    """
-    lines: list[str] = []
-    for s in shapes:
-        pts = [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for x, y in s.points]
-        if s.kind == "detect" and len(pts) >= 4:
-            xs = [p[0] for p in pts[:4]]
-            ys = [p[1] for p in pts[:4]]
-            x1, x2 = min(xs), max(xs)
-            y1, y2 = min(ys), max(ys)
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            w, h = max(0.0, x2 - x1), max(0.0, y2 - y1)
-            lines.append(f"{s.class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-        elif s.kind == "obb" and len(pts) >= 4:
-            vals: list[str] = []
-            for x, y in pts[:4]:
-                vals.extend([f"{x:.6f}", f"{y:.6f}"])
-            lines.append(f"{s.class_id} " + " ".join(vals))
+    """原生 YOLO 写回；显式导出训练标签时由转换器选择单一任务。"""
+    lines = []
+    for shape in shapes:
+        points = [(max(0., min(1., x)), max(0., min(1., y))) for x, y in shape.points]
+        if shape.kind == "detect" and len(points) >= 4:
+            xs, ys = zip(*points)
+            x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+            values = [(x1+x2)/2, (y1+y2)/2, x2-x1, y2-y1]
+        elif shape.kind in {"obb", "segment"} and len(points) >= 3:
+            values = [v for point in (points[:4] if shape.kind == "obb" else points) for v in point]
         else:
-            vals = []
-            for x, y in pts:
-                vals.extend([f"{x:.6f}", f"{y:.6f}"])
-            if len(vals) < 6:
-                continue
-            lines.append(f"{s.class_id} " + " ".join(vals))
+            raise AnnotationError(f"YOLO 不支持此形状：{shape.kind}，请另存为 LabelMe")
+        if shape.confidence is not None:
+            values.append(float(shape.confidence))
+        lines.append(f"{shape.class_id} " + " ".join(f"{v:.8f}" for v in values))
     return lines
 
 
@@ -996,14 +994,6 @@ def write_yolo_label_file(label_path: Path, shapes: list) -> bool:
     except OSError:
         return False
 
-
-@dataclass
-class LabelShape:
-    class_id: int
-    class_name: str
-    kind: str
-    points: list[tuple[float, float]]
-    confidence: float | None = None
 
 class LabelStore:
     def __init__(self) -> None:
@@ -1020,6 +1010,10 @@ class LabelStore:
         self._label_cache_max = 50
         self._label_index: dict[str, list[Path]] = {}
         self._source_by_image: dict[str, Path] = {}  # 记录每张图片实际加载的标签文件，用于编辑后原地写回
+        self._labelme_documents = {}
+        self._coco_document = {}
+        self.image_root = ""
+        self._format_cache_key = None
 
     def configure(self, label_format: str, yolo_type: str, label_dir: str, detect_box_format: str = "auto") -> None:
         self.format = label_format
@@ -1029,6 +1023,13 @@ class LabelStore:
         self._rebuild_label_index()
 
     def detect_format(self) -> str:
+        key = self.label_dir, self.coco_file
+        if key != self._format_cache_key:
+            self._format_cache_value = self._detect_format_uncached()
+            self._format_cache_key = key
+        return self._format_cache_value
+
+    def _detect_format_uncached(self) -> str:
         """自动检测标签格式。"""
         if self.coco_file and Path(self.coco_file).exists():
             return "coco"
@@ -1041,18 +1042,24 @@ class LabelStore:
         txt_count = 0
         try:
             for p in root.rglob("*.json"):
-                if p.is_file():
+                # 转换报告等辅助 JSON 不是标签文件，按文件名排除
+                if p.is_file() and not p.name.startswith(".") and p.name.lower() != "conversion_report.json":
+                    try:
+                        if "shapes" not in json.loads(p.read_text(encoding="utf-8-sig")):
+                            continue
+                    except (OSError, ValueError):
+                        continue
                     json_count += 1
                     if json_count > 5:
                         break
             for p in root.rglob("*.txt"):
-                if p.is_file():
+                if p.is_file() and p.name.lower() not in {"classes.txt", "labels.txt"}:
                     txt_count += 1
                     if txt_count > 5:
                         break
         except OSError:
             pass
-        if json_count > 0 and txt_count == 0:
+        if json_count > 0:
             return "labelme"
         if txt_count > 0 and json_count == 0:
             return "yolo"
@@ -1116,6 +1123,7 @@ class LabelStore:
         self.active_classes = None if active == set(range(len(self.classes))) else active
 
     def clear_label_cache(self) -> None:
+        self._format_cache_key = None
         self._label_cache.clear()
         self._source_by_image.clear()
         self._rebuild_label_index()
@@ -1124,11 +1132,11 @@ class LabelStore:
         """获取该图片实际加载的标签文件路径（用于编辑后写回）。"""
         return self._source_by_image.get(image_path)
 
-    def load_for_image(self, image_path: str, image_size: tuple[int, int]) -> list[LabelShape]:
+    def load_for_image(self, image_path: str, image_size: tuple[int, int], include_hidden: bool = False) -> list[LabelShape]:
         if image_path in self._label_cache:
             self._label_cache.move_to_end(image_path)
             labels = list(self._label_cache[image_path])
-            if self.active_classes is not None:
+            if self.active_classes is not None and not include_hidden:
                 return [lb for lb in labels if lb.class_id in self.active_classes]
             return labels
 
@@ -1137,7 +1145,10 @@ class LabelStore:
         else:
             fmt = self.format
         if fmt == "coco":
-            labels = list(self._coco_by_name.get(Path(image_path).name, []))
+            key = self.coco_key_for_image(image_path)
+            labels = copy.deepcopy(self._coco_by_name.get(key, []))
+            if key is not None:
+                self._source_by_image[image_path] = Path(self.coco_file)
         elif fmt == "labelme":
             labels = self._load_labelme(image_path, image_size)
         else:
@@ -1147,7 +1158,7 @@ class LabelStore:
         if len(self._label_cache) > self._label_cache_max:
             self._label_cache.popitem(last=False)
 
-        if self.active_classes is not None:
+        if self.active_classes is not None and not include_hidden:
             labels = [lb for lb in labels if lb.class_id in self.active_classes]
         return labels
 
@@ -1155,7 +1166,7 @@ class LabelStore:
         img = Path(image_path)
         fmt = self.effective_format()
         if fmt == "coco":
-            count = len(self._coco_by_name.get(img.name, []))
+            count = len(self._coco_by_name.get(self.coco_key_for_image(image_path), []))
             return count > 0, f"COCO: {count} 个" if count else ""
         if not self.label_dir:
             return False, ""
@@ -1184,54 +1195,28 @@ class LabelStore:
             return 0
 
     def load_coco(self, path: str) -> int:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        if not all(isinstance(data.get(k), list) for k in ("images", "annotations", "categories")):
+            raise AnnotationError("不是 COCO 数据集：需要 images、annotations、categories")
+        classes = list(self.classes)
+        by_name = coco_shapes(data, classes)
         self.coco_file = path
         self.format = "coco"
-        self._coco_by_name.clear()
-        p = Path(path)
-        if not p.exists():
-            return 0
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        categories = {c["id"]: c.get("name", str(c["id"])) for c in data.get("categories", []) if "id" in c}
-        for name in categories.values():
-            self.class_id_for_name(str(name))
-        images = {img["id"]: img for img in data.get("images", [])}
-        count = 0
-        for ann in data.get("annotations", []):
-            img = images.get(ann.get("image_id"))
-            if not img:
-                continue
-            width = safe_float(img.get("width", 1), 1.0) or 1.0
-            height = safe_float(img.get("height", 1), 1.0) or 1.0
-            cat_name = str(categories.get(ann.get("category_id"), ann.get("category_id", "unknown")))
-            class_id = self.class_id_for_name(cat_name)
-            if ann.get("bbox"):
-                if len(ann["bbox"]) < 4:
-                    continue
-                x, y, w, h = [safe_float(v, 0.0) for v in ann["bbox"][:4]]
-                points = [
-                    (x / width, y / height),
-                    ((x + w) / width, y / height),
-                    ((x + w) / width, (y + h) / height),
-                    (x / width, (y + h) / height),
-                ]
-                self._coco_by_name.setdefault(img["file_name"], []).append(
-                    LabelShape(class_id, cat_name, "detect", points)
-                )
-                count += 1
-            seg = ann.get("segmentation")
-            if isinstance(seg, list):
-                for poly in seg:
-                    if isinstance(poly, list) and len(poly) >= 6:
-                        points = [
-                            (safe_float(poly[i], 0.0) / width, safe_float(poly[i + 1], 0.0) / height)
-                            for i in range(0, len(poly) - 1, 2)
-                        ]
-                        self._coco_by_name.setdefault(img["file_name"], []).append(
-                            LabelShape(class_id, cat_name, "segment", points)
-                        )
-                        count += 1
-        return count
+        self.classes = classes
+        self._coco_document = data
+        self._coco_by_name = by_name
+        self._label_cache.clear()
+        return sum(map(len, by_name.values()))
+
+    def coco_key_for_image(self, image_path: str):
+        normalized = str(image_path).replace("\\", "/")
+        matches = [key for key in self._coco_by_name if normalized == key or normalized.endswith("/" + key)]
+        if matches:
+            return max(matches, key=len)
+        matches = [key for key in self._coco_by_name if Path(key).name == Path(image_path).name]
+        if len(matches) > 1:
+            raise AnnotationError("COCO 中有多个同名图片，请保留原相对目录结构")
+        return matches[0] if matches else None
 
     def _label_path(self, image_path: str, suffix: str) -> Path:
         img = Path(image_path)
@@ -1242,8 +1227,19 @@ class LabelStore:
     def _label_candidates(self, image_path: str, suffix: str) -> list[Path]:
         img = Path(image_path)
         candidates: list[Path] = []
+        if self.label_dir and self.image_root:
+            try:
+                exact = Path(self.label_dir) / img.resolve().relative_to(Path(self.image_root).resolve()).with_suffix(suffix)
+                if exact.is_file():
+                    return [exact]
+            except ValueError:
+                pass
+        if not self.label_dir:
+            return [img.with_suffix(suffix)]
         # 优先从子目录索引中查找
         indexed = self._label_index.get(img.stem, [])
+        if len(indexed) > 1:
+            raise AnnotationError(f"{img.name} 有多个同名标签，请保留图片与标注的相对目录结构")
         for p in indexed:
             if p.suffix.lower() == suffix.lower():
                 candidates.append(p)
@@ -1258,64 +1254,10 @@ class LabelStore:
         p = next((path for path in self._label_candidates(image_path, ".json") if path.exists()), None)
         if not p:
             return []
+        shapes, document = read_labelme(p, image_size, self.classes)
         self._source_by_image[image_path] = p
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-        img_w = data.get("imageWidth")
-        img_h = data.get("imageHeight")
-        # 如果imageWidth/imageHeight为None或<=0，使用传入的image_size
-        if img_w is None or img_w <= 0:
-            img_w = image_size[0]
-        if img_h is None or img_h <= 0:
-            img_h = image_size[1]
-        width = float(img_w) if img_w else 1.0
-        height = float(img_h) if img_h else 1.0
-        labels: list[LabelShape] = []
-        for shape in data.get("shapes", []):
-            name = str(shape.get("label", "unknown"))
-            class_id = self.class_id_for_name(name)
-            confidence = shape.get("score")
-            if confidence is not None:
-                try:
-                    confidence = float(confidence)
-                except (TypeError, ValueError):
-                    confidence = None
-            raw_points = shape.get("points", [])
-            if not raw_points:
-                continue
-            # 读取原始坐标
-            points: list[tuple[float, float]] = []
-            for point in raw_points:
-                if not isinstance(point, (list, tuple)) or len(point) < 2:
-                    continue
-                points.append((safe_float(point[0], 0.0), safe_float(point[1], 0.0)))
-            if len(points) < 2:
-                continue
-            # 检查坐标是否已经是归一化的（所有坐标都在 [0, 1] 范围内）
-            all_normalized = all(0.0 <= p[0] <= 1.0 and 0.0 <= p[1] <= 1.0 for p in points)
-            if all_normalized:
-                # 坐标已经是归一化的，不需要处理
-                pass
-            else:
-                # 坐标是像素值，需要用图像尺寸归一化
-                points = [(p[0] / width, p[1] / height) for p in points]
-            shape_type = shape.get("shape_type", "")
-            if shape_type == "rectangle" and len(points) == 2:
-                (x1, y1), (x2, y2) = points[:2]
-                points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-                kind = "detect"
-            elif shape_type == "rectangle" and len(points) >= 4:
-                points = points[:4]
-                kind = "detect"
-            elif len(points) == 4:
-                kind = "obb"
-            else:
-                kind = "segment"
-            labels.append(LabelShape(class_id, name, kind, points, confidence))
-        return labels
+        self._labelme_documents[image_path] = document
+        return shapes
 
     def _load_yolo(self, image_path: str, image_size: tuple[int, int]) -> list[LabelShape]:
         p = next((path for path in self._label_candidates(image_path, ".txt") if path.exists()), None)
@@ -1323,12 +1265,20 @@ class LabelStore:
             return []
         self._source_by_image[image_path] = p
         labels: list[LabelShape] = []
+        task_path = Path(self.label_dir) / ".annotation_task.json"
+        task_kind = json.loads(task_path.read_text(encoding="utf-8")).get("task", "auto") if task_path.is_file() else "auto"
+        schema_path = Path(self.label_dir) / ".annotation_types.json"
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8")) if schema_path.is_file() else {}
+            row_kinds = schema.get(str(p.relative_to(schema_path.parent)), schema.get(str(p.resolve()), []))
+        except (OSError, ValueError):
+            row_kinds = []
         try:
             f = open(p, "r", encoding="utf-8")
         except OSError:
             return []
         with f:
-            for line in f:
+            for row_index, line in enumerate(f):
                 parts = line.strip().split()
                 if len(parts) < 5:
                     continue
@@ -1341,16 +1291,20 @@ class LabelStore:
                     continue
                 class_name = self.ensure_class_id(class_id)
                 # 自动检测类型：8 值→obb，6+ 偶数值→segment，4 值→detect
-                yolo_type = self.yolo_type
+                yolo_type = self.yolo_type if self.yolo_type != "auto" else task_kind
+                if yolo_type == "auto" and row_index < len(row_kinds):
+                    yolo_type = row_kinds[row_index]
                 if yolo_type == "auto":
-                    if len(values) >= 8:
+                    if len(values) in {8, 9}:
                         yolo_type = "obb"
+                    elif len(values) > 9:
+                        yolo_type = "segment"
                     elif len(values) >= 6 and len(values) % 2 == 0:
                         yolo_type = "segment"
                     elif len(values) >= 6 and len(values) % 2 == 1:
                         # 奇数个值（末尾是 confidence），去掉后判断
                         remaining = len(values) - 1
-                        if remaining >= 8:
+                        if remaining == 8:
                             yolo_type = "obb"
                         else:
                             yolo_type = "segment"
@@ -1363,7 +1317,8 @@ class LabelStore:
                 elif yolo_type == "segment" and len(values) >= 6:
                     usable = values[:-1] if len(values) % 2 == 1 else values
                     points = [(usable[i], usable[i + 1]) for i in range(0, len(usable) - 1, 2)]
-                    labels.append(LabelShape(class_id, class_name, "segment", points))
+                    conf = values[-1] if len(values) % 2 else None
+                    labels.append(LabelShape(class_id, class_name, "segment", points, conf))
                 elif len(values) >= 4:
                     points = self._parse_detect_points(values[:4], image_size)
                     conf = values[4] if len(values) > 4 else None
@@ -1393,9 +1348,8 @@ class LabelStore:
             else:
                 xc, yc, w, h = a / img_w, b / img_h, c / img_w, d / img_h
                 x1, y1, x2, y2 = xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2
-        elif c > a and d > b and (c - a) < 0.98 and (d - b) < 0.98:
-            x1, y1, x2, y2 = a, b, c, d
         else:
+            # 标准 YOLO 使用归一化中心点宽高；xyxy 必须由用户明确选择。
             xc, yc, w, h = a, b, c, d
             x1, y1, x2, y2 = xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2
 
@@ -1593,9 +1547,9 @@ class HighPerformanceSlider(ttk.Frame):
 class ToolTip:
     """简单的悬停提示框，鼠标移入控件时显示完整文本。"""
 
-    def __init__(self, widget: tk.Widget, text_func=None) -> None:
+    def __init__(self, widget: tk.Widget, text_func=None, *, text: str = "") -> None:
         self.widget = widget
-        self._text_func = text_func or (lambda: "")
+        self._text_func = text_func or (lambda: text)
         self._tip: tk.Toplevel | None = None
         self._id_enter = widget.bind("<Enter>", self._show, add="+")
         self._id_leave = widget.bind("<Leave>", self._hide, add="+")
@@ -2531,6 +2485,7 @@ class VideoExtractTask:
 
         btn_row = ttk.Frame(main)
         btn_row.pack(fill="x", pady=(2, 0))
+        self.actions_row = btn_row
         self.start_btn = ttk.Button(btn_row, text="开始", command=self._start, width=6, style="Action.TButton")
         self.start_btn.pack(side="left")
         self.pause_btn = ttk.Button(btn_row, text="暂停", command=self._pause, state="disabled", width=5)
@@ -3516,15 +3471,17 @@ class TutorialOverlay:
             self.on_finish(completed)
 
 
-class TkImageBrowser:
+class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMixin):
     # 类级别：保存所有活跃的 dedupe 缓存引用，进程崩溃时 excepthook 兜底刷盘
     _active_caches: list[DedupeCache] = []
 
-    def __init__(self) -> None:
+    def __init__(self, *, visible: bool = True) -> None:
         self.root = tk.Tk()
+        if not visible:
+            self.root.withdraw()
         self.root.title(f"图片筛选工具 {VERSION}")
         self.root.geometry("1280x840")
-        self.root.minsize(1200, 800)
+        self.root.minsize(1040, 700)
 
         self.config = self._load_config()
         self.label_store = LabelStore()
@@ -3618,7 +3575,7 @@ class TkImageBrowser:
         self._update_path_labels()
         self._update_dedupe_task_buttons()
 
-        self.root.after(500, self._show_task_restore_prompt)
+        self._startup_restore_after_id = self.root.after(500, self._show_task_restore_prompt)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._drain_after_id = self.root.after(100, self._drain_queue)
         self._sash_after_id = self.root.after(200, self._set_sash_positions)
@@ -3649,34 +3606,13 @@ class TkImageBrowser:
             pass
 
     def _show_task_restore_prompt(self) -> None:
-        last_dir = self.config.get("last_dir", "")
-        last_index = self.config.get("last_index", 0)
-        has_prev_task = bool(last_dir)
-        
-        if not has_prev_task:
-            self._task_restore_choice = "none"
-            return
-        
-        self.root.update()
-        
-        result = messagebox.askyesnocancel(
-            "恢复任务",
-            f"检测到上次未完成的任务，是否恢复？\n\n上次目录: {last_dir}\n上次位置: 第 {last_index + 1} 张图片",
-            default=messagebox.YES
-        )
-        
-        if result is True:
-            self._task_restore_choice = "restore"
-            self.notify_flow("[任务] 即将恢复上次任务...")
-        elif result is False:
-            self._task_restore_choice = "clear"
-            self.config.clear()
-            self._save_config()
-            self.notify_flow("[任务] 已清空上次任务记录")
-        else:
-            self._task_restore_choice = "cancel"
-        
-        self.root.after(100, self._restore_config)
+        """恢复入口放在欢迎页，启动时不弹窗打断用户。"""
+        if not self.dir_var.get() and self.config.get("last_dir"):
+            self.status_var.set("可从欢迎页继续上次浏览，或打开新文件夹")
+
+    def _resume_workspace(self) -> None:
+        self._task_restore_choice = "restore"
+        self._restore_config()
 
     def _show_about(self) -> None:
         """显示软件介绍和版本日志对话框。"""
@@ -3799,7 +3735,7 @@ class TkImageBrowser:
         """注册引导要高亮的目标控件（找不到则跳过高亮）。"""
         targets = {
             "toolbar": getattr(self, "top_bar", None),
-            "nav": getattr(self, "sidebar", None) or getattr(self, "nav_frame", None),
+            "nav": self.top_bar,
             "browser": self._panels.get("browse"),
             "extract": self._panels.get("video"),
             "dedupe": self._panels.get("dedupe"),
@@ -3830,35 +3766,35 @@ class TkImageBrowser:
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
 
-        # ---- 导入 ----
+        # 图片的唯一导入动作就是打开目录；标签来源属于标签检查。
         import_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="导入", menu=import_menu)
-        import_menu.add_command(label="导入图片目录…", command=self.open_image_dir)
-        import_menu.add_separator()
-        import_menu.add_command(label="导入标签目录（GT）…", command=self.select_label_dir)
+        menubar.add_cascade(label="标签", menu=import_menu)
+        import_menu.add_command(label="导入标注文件（COCO / LabelMe）…", command=self.import_annotation_file)
+        import_menu.add_command(label="导入标注目录（YOLO / LabelMe）…", command=self.select_label_dir)
         import_menu.add_command(label="导入预测标签目录（PRED）…", command=self.select_pred_label_dir)
-        import_menu.add_command(label="导入 COCO JSON…", command=self.select_coco)
         import_menu.add_command(label="导入类别文件（classes.txt）…", command=self.select_classes)
 
         # ---- 导出 ----
         export_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="导出", menu=export_menu)
-        export_menu.add_command(label="导出当前标签（YOLO）…", command=self.export_current_labels)
-        export_menu.add_command(label="批量导出全部标签（YOLO）…", command=self.export_all_labels)
+        export_menu.add_command(label="导出 / 转换标注…", command=self.show_annotation_export)
         export_menu.add_command(label="导出类别文件（classes.txt）…", command=self.export_classes)
 
         # ---- 视图：模块直达入口（与左侧 Tab 同 command，保证入口统一） ----
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="视图", menu=view_menu)
         for i, (key, title) in enumerate([
-            ("browse", "数据浏览"),
-            ("labels", "标签显示"),
-            ("marks", "标记转移"),
+            ("browse", "图片工作台"),
+            ("labels", "工作台 / 标签检查"),
+            ("marks", "工作台 / 分类整理"),
             ("video", "视频抽帧"),
             ("dedupe", "相似去重"),
         ], start=1):
             view_menu.add_command(label=f"转到 {title}", accelerator=f"Ctrl+{i}",
                                   command=lambda k=key: self.show_panel(k))
+        view_menu.add_separator()
+        view_menu.add_checkbutton(label="展开操作日志", variable=self._log_expanded,
+                                  command=self._toggle_log)
 
         # ---- 设置 ----
         settings_menu = tk.Menu(menubar, tearoff=0)
@@ -3867,8 +3803,7 @@ class TkImageBrowser:
         settings_menu.add_checkbutton(label="显示 GT（真实标签）", variable=self.show_gt_var, command=self._on_display_option_changed)
         settings_menu.add_checkbutton(label="显示 PRED（预测标签）", variable=self.show_pred_var, command=self._on_display_option_changed)
         settings_menu.add_separator()
-        settings_menu.add_checkbutton(label="递归子目录", variable=self.recursive, command=self._save_config)
-        settings_menu.add_checkbutton(label="自动保存标签修改", variable=self.auto_save_labels_var, command=self._save_config)
+        settings_menu.add_checkbutton(label="递归子目录", variable=self.recursive, command=lambda: (self._save_config(), self._reload_recursive()))
         settings_menu.add_checkbutton(label="最大性能模式", variable=self.performance_mode, command=self._save_config)
 
         # ---- 帮助 ----
@@ -3901,7 +3836,6 @@ class TkImageBrowser:
             "pred_label_dir_history": getattr(self, "_pred_dir_history", []),
             "show_gt": self.show_gt_var.get(),
             "show_pred": self.show_pred_var.get(),
-            "auto_save_labels": self.auto_save_labels_var.get(),
             "classes_file": self.classes_file_var.get(),
             "classes_file_history": self._classes_file_history,
             "label_format": self.label_format_var.get(),
@@ -3914,10 +3848,11 @@ class TkImageBrowser:
             "dedupe_cache_enabled": self.dedupe_cache_var.get(),
             "tutorial_seen": self.config.get("tutorial_seen", False),
             "categories": self._categories(),
-            "last_index": self.current_index,
+            "last_index": (self._workspace_browse_state[1] if self._current_module not in self.IMAGE_SECTIONS and hasattr(self, "_workspace_browse_state") else self.current_index),
             "active_classes": [name for name, var in self.class_vars.items() if var.get()],
             "dedupe_tasks": [task.to_config() for task in getattr(self, "dedupe_tasks", [])],
             "last_module": getattr(self, "_current_module", "browse"),
+            "mark_auto_next": self.mark_auto_next_var.get(),
         }
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -3927,6 +3862,8 @@ class TkImageBrowser:
                 self.notify_flow("[配置] 保存失败，不影响当前操作")
 
     def _build_ui(self) -> None:
+        self._icons = IconFactory(self.root)
+        self.root.iconphoto(True, self._icons.get("workspace", size=32, color="#2563eb"))
         self.status_var = StringVar(value="请选择图片目录开始")
         self.progress_var = DoubleVar(value=0)
         self.dir_var = StringVar()
@@ -3942,7 +3879,6 @@ class TkImageBrowser:
         self.pred_label_dir_var = StringVar()
         self.show_gt_var = BooleanVar(value=bool(self.config.get("show_gt", True)))
         self.show_pred_var = BooleanVar(value=bool(self.config.get("show_pred", True)))
-        self.auto_save_labels_var = BooleanVar(value=bool(self.config.get("auto_save_labels", True)))
         self._auto_fit = BooleanVar(value=True)
         self.recursive = BooleanVar(value=bool(self.config.get("recursive", False)))
         self.keep_structure = BooleanVar(value=True)
@@ -3950,6 +3886,12 @@ class TkImageBrowser:
         self.auto_shutdown = BooleanVar(value=False)
         # 相似去重崩溃恢复缓存开关：默认关闭（单机使用最快），开启后中途崩溃/中断可恢复进度
         self.dedupe_cache_var = BooleanVar(value=bool(self.config.get("dedupe_cache_enabled", False)))
+        self.edit_mode_var = BooleanVar(value=False)
+        self.editor_tool_var = StringVar(value="浏览")
+        self._polygon_points = []
+        self.mark_auto_next_var = BooleanVar(value=bool(self.config.get("mark_auto_next", False)))
+        self._log_expanded = BooleanVar(value=False)
+        self._workspace_section = "browse"
         self._panels: dict[str, ttk.Frame] = {}
         self._nav_buttons: dict[str, ttk.Button] = {}
         self._module_logs: dict[str, list[str]] = {}
@@ -3960,12 +3902,43 @@ class TkImageBrowser:
         self._build_menubar()
 
         style = ttk.Style(self.root)
+        style.theme_use("clam")
+        self.root.option_add("*Font", ("Microsoft YaHei UI", scale_font_size(9)))
+        style.configure(".", background="#f3f5f9", foreground="#263449",
+                        font=("Microsoft YaHei UI", scale_font_size(9)))
+        style.configure("TFrame", background="#f3f5f9")
+        style.configure("TLabel", background="#f3f5f9")
+        style.configure("TButton", padding=(8, 5), background="#ffffff", borderwidth=1)
+        style.map("TButton", background=[("active", "#e8eef9"), ("disabled", "#eef1f5")],
+                  foreground=[("disabled", "#97a1b2")])
+        style.configure("TCheckbutton", padding=(0, 3))
+        style.configure("TLabelframe", bordercolor="#dce3ee", relief="solid")
+        style.configure("TLabelframe.Label", foreground="#526176")
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff",
+                        rowheight=round(29 * DPI_SCALE), borderwidth=0)
+        style.configure("Treeview.Heading", background="#eaf0f8", padding=5)
+        style.map("Treeview", background=[("selected", "#dceaff")],
+                  foreground=[("selected", "#164aa3")])
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", scale_font_size(10), "bold"))
         style.configure("Nav.TButton", anchor="w", padding=(round(10 * DPI_SCALE), round(8 * DPI_SCALE)))
-        style.configure("Active.Nav.TButton", anchor="w", padding=(round(10 * DPI_SCALE), round(8 * DPI_SCALE)))
+        style.configure("Nav.TButton", relief="flat", borderwidth=0)
+        style.configure("Active.Nav.TButton", anchor="w", background="#dceaff", foreground="#1d4ed8", padding=(round(10 * DPI_SCALE), round(8 * DPI_SCALE)))
+        style.map("Active.Nav.TButton", background=[("active", "#cbdfff")])
+        style.configure("Active.Nav.TButton", relief="flat", borderwidth=0)
+        style.configure("Tool.TButton", relief="flat", borderwidth=0, padding=7, background="#f3f5f9")
+        style.map("Tool.TButton", background=[("active", "#e0eaff"), ("disabled", "#f3f5f9")])
+        for name in ["Editor.TRadiobutton", "Toggle.TCheckbutton"]:
+            style.layout(name, style.layout("Toolbutton"))
+            style.configure(name, padding=7, borderwidth=0, relief="flat", background="#f3f5f9")
+            style.map(name, background=[("selected", "#dbeafe"), ("active", "#e7edf8")])
+        style.configure("Inspector.TButton", padding=(8, 5), relief="flat", borderwidth=0)
+        style.configure("Active.Inspector.TButton", padding=(8, 5), relief="flat", borderwidth=0, background="#dbeafe", foreground="#1d4ed8")
         style.configure("Hint.TLabel", font=("Microsoft YaHei UI", scale_font_size(8)), foreground="gray")
         style.configure("Compact.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)))
         style.configure("Action.TButton", padding=(round(6 * DPI_SCALE), round(3 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(8)), background="#3b82f6")
+        style.configure("Action.TButton", foreground="#ffffff", padding=(10, 7))
+        style.map("Action.TButton", background=[("active", "#2563eb"), ("disabled", "#d7e0ef")],
+                  foreground=[("disabled", "#8996a9")])
         style.configure("Danger.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)), foreground="#ef4444")
         style.configure("Accent.TButton", padding=(round(4 * DPI_SCALE), round(2 * DPI_SCALE)), font=("Microsoft YaHei UI", scale_font_size(7)), foreground="#8b5cf6")
         style.configure("CompactTask.TLabelframe", font=("Microsoft YaHei UI", scale_font_size(8)))
@@ -3982,6 +3955,7 @@ class TkImageBrowser:
         # X-AnyLabeling 风格快捷键：Ctrl+O 打开目录、Ctrl+S 保存标签
         self.root.bind("<Control-o>", lambda _e: (self.open_image_dir(), "break")[1])
         self.root.bind("<Control-s>", lambda _e: (self._save_current_labels(force=True), "break")[1])
+        self.root.bind("<Control-f>", self._focus_image_search)
         # Ctrl+1~5 模块直达，与「视图」菜单项一一对应
         for _i, _key in enumerate(["browse", "labels", "marks", "video", "dedupe"], start=1):
             self.root.bind(f"<Control-{_i}>", lambda _e, k=_key: self.show_panel(k))
@@ -3996,24 +3970,28 @@ class TkImageBrowser:
         nav_tabs = ttk.Frame(top_bar)
         nav_tabs.pack(side="left", fill="x", expand=True)
         for key, title in [
-            ("browse", "📁 数据浏览"),
-            ("labels", "🏷️ 标签显示"),
-            ("marks", "➡️ 标记转移"),
-            ("video", "🎬 视频抽帧"),
-            ("dedupe", "🔍 相似去重"),
+            ("browse", "图片工作台"),
+            ("video", "视频抽帧"),
+            ("dedupe", "相似去重"),
         ]:
-            btn = ttk.Button(nav_tabs, text=title, style="Nav.TButton", command=lambda k=key: self.show_panel(k))
+            btn = ttk.Button(nav_tabs, text=title, style="Nav.TButton", command=lambda k=key: self.show_panel("workspace" if k == "browse" else k))
+            btn.configure(image=self._icons.get({"browse":"workspace", "video":"video", "dedupe":"duplicates"}[key]), compound="left")
             btn.pack(side="left", padx=(0, 2))
             self._nav_buttons[key] = btn
 
         view_options = ttk.Frame(top_bar)
         view_options.pack(side="left", padx=(20, 0))
-        ttk.Checkbutton(view_options, text="适应窗口", variable=self._auto_fit, command=self.fit_image).pack(side="left")
-        ttk.Checkbutton(view_options, text="显示标签", variable=self.labels_visible, command=self.toggle_label_visibility).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(view_options, text="最大性能", variable=self.performance_mode, command=self._save_config).pack(side="left", padx=(8, 0))
+        self._icon_button(view_options, "folder", self.open_image_dir, "打开图片文件夹（Ctrl+O）", text="打开图片", style="Action.TButton").pack(side="left")
+
+        # 顶部水平工具栏（原左侧竖栏迁移至此）；仅在图片工作台相关模块显示
+        self._tool_bar = ttk.Frame(main, padding=(4, 2))
+        self._build_tool_bar()
+        self._tool_bar.pack(fill="x", pady=(2, 0))
 
         # 工具栏只保留高频视图开关；帮助/教程/关于统一收进「帮助」菜单，避免重复入口
-        self.body = ttk.PanedWindow(main, orient="horizontal")
+        self._work_area = ttk.Frame(main)
+        self._work_area.pack(fill="both", expand=True, pady=(6, 0))
+        self.body = ttk.PanedWindow(self._work_area, orient="horizontal")
         self.body.pack(fill="both", expand=True, pady=(6, 0))
 
         center = ttk.Frame(self.body)
@@ -4026,6 +4004,7 @@ class TkImageBrowser:
         ttk.Label(header, textvariable=self.image_info_var, anchor="e").pack(side="right")
 
         nav_below = ttk.Frame(center)
+        self._preview_nav = nav_below
         nav_below.pack(fill="x", pady=(0, 2))
         ttk.Label(nav_below, text="当前:", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(10, 2))
         self._index_entry = tk.Entry(nav_below, width=5, justify="center", font=("Microsoft YaHei UI", 9, "bold"), bd=1, relief="solid")
@@ -4036,17 +4015,20 @@ class TkImageBrowser:
         self._index_entry.pack(side="left")
         self._total_label = ttk.Label(nav_below, text=" / 0", font=("Microsoft YaHei UI", 9, "bold"))
         self._total_label.pack(side="left")
-        self._prev_nav_btn = ttk.Button(nav_below, width=10)
+        self._prev_nav_btn = self._icon_button(nav_below, "previous", self.prev_image, lambda: "上一组" if self._current_module == "dedupe" else "上一张（A / ←）")
         self._prev_nav_btn.pack(side="left", padx=(8, 0))
-        self._next_nav_btn = ttk.Button(nav_below, width=10)
+        self._next_nav_btn = self._icon_button(nav_below, "next", self.next_image, lambda: "下一组" if self._current_module == "dedupe" else "下一张（D / →）")
         self._next_nav_btn.pack(side="left", padx=(4, 0))
+        self._image_tools = ttk.Frame(nav_below)
+        self._image_tools.pack(side="right")
+        ttk.Label(self._image_tools, textvariable=self.editor_tool_var, style="Hint.TLabel").pack(side="right", padx=6)
         self._update_nav_buttons_for_module(self._current_module)
 
         self.center_content = ttk.Frame(center)
         self.center_content.pack(fill="both", expand=True)
         self.image_canvas_host = ttk.Frame(self.center_content)
         self.image_canvas_host.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(self.image_canvas_host, bg="#202124", highlightthickness=0)
+        self.canvas = tk.Canvas(self.image_canvas_host, bg="#172132", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
@@ -4057,6 +4039,12 @@ class TkImageBrowser:
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.canvas.bind("<ButtonPress-3>", self._on_canvas_pan_start)
         self.canvas.bind("<B3-Motion>", self._on_canvas_pan_move)
+        self.canvas.bind("<ButtonRelease-3>", self._on_canvas_right_release, add="+")
+        self.canvas.bind("<Motion>", self._editor_polygon_preview)
+        self.canvas.bind("<Return>", self._editor_finish_polygon)
+        self._build_empty_state()
+        self._preview_hint_var = StringVar(value="滚轮缩放 · 左键拖动 · A / D 切图 · F 适应窗口")
+        ttk.Label(self.image_canvas_host, textvariable=self._preview_hint_var, style="Hint.TLabel", anchor="center").pack(fill="x", side="bottom", pady=4)
 
         self.image_slider_frame = ttk.Frame(self.image_canvas_host)
         self.image_slider_frame.pack(fill="x", pady=(2, 0))
@@ -4076,12 +4064,27 @@ class TkImageBrowser:
         )
         self.dedupe_canvas_view.pack(fill="both", expand=True)
 
-        right = ttk.Frame(self.body, width=360, padding=6)
+        right = ttk.Frame(self.body, width=350, padding=6)
+        self._inspector_pane = right
         self.body.add(right, weight=0)
+        # 右栏上下分区：上=参数面板，下=图片库（搜索 + 列表 + 分页），中间可拖动
+        self._right_paned = ttk.PanedWindow(right, orient="vertical")
+        self._right_paned.pack(fill="both", expand=True)
+        top_host = ttk.Frame(self._right_paned)
+        self._right_paned.add(top_host, weight=3)
+        self._inspector_tabs = ttk.Frame(top_host)
+        self._inspector_tabs.pack(fill="x", pady=(0, 10))
+        self._section_buttons = {}
+        for key, title in [("browse", "概览"), ("labels", "标签检查"), ("marks", "分类整理")]:
+            button = ttk.Button(self._inspector_tabs, text=title, style="Inspector.TButton", command=lambda k=key: self.show_panel(k),
+                                image=self._icons.get({"browse":"workspace", "labels":"rectangle", "marks":"tag"}[key],size=18), compound="left")
+            button.pack(side="left", fill="x", expand=True, padx=1)
+            self._section_buttons[key] = button
         self._param_title_var = StringVar(value="参数设置")
-        ttk.Label(right, textvariable=self._param_title_var, style="Title.TLabel").pack(anchor="w", pady=(0, 6))
+        self._param_title_label = ttk.Label(top_host, textvariable=self._param_title_var, style="Title.TLabel")
+        self._param_title_label.pack(anchor="w", pady=(0, 6))
         # 右侧参数栏三段式：每个面板自带内部滚动内容区 + 底部固定操作区
-        self.panel_host = ttk.Frame(right)
+        self.panel_host = ttk.Frame(top_host)
         self.panel_host.pack(fill="both", expand=True)
         self._panel_scrolls = {}
         self._build_browse_panel()
@@ -4089,12 +4092,17 @@ class TkImageBrowser:
         self._build_mark_panel()
         self._build_video_panel()
         self._build_dedupe_panel()
+        # 图片库挂到右栏下半区
+        self._build_library_panel(self._right_paned)
+        self._right_paned.add(self._library_pane, weight=2)
         self.show_panel("browse")
 
-        bottom = ttk.LabelFrame(main, text="操作日志", padding=(6, 4))
+        bottom = ttk.Frame(main, padding=(6, 4))
         bottom.pack(fill="x", pady=(6, 0))
         log_toolbar = ttk.Frame(bottom)
         log_toolbar.pack(fill="x", pady=(0, 4))
+        self._log_toggle_btn = ttk.Button(log_toolbar, text="展开日志", command=self._toggle_log_command)
+        self._log_toggle_btn.pack(side="left", padx=(0, 6))
         # 历史记录/清空等低频操作收进「⋯」下拉，保持日志栏紧凑
         log_menu_btn = tk.Menubutton(log_toolbar, text="⋯", width=3, relief="flat",
                                      font=("Microsoft YaHei UI", 9, "bold"), direction="below")
@@ -4104,14 +4112,8 @@ class TkImageBrowser:
         log_menu.add_command(label="清空日志", command=self._clear_flow_log)
         log_menu_btn["menu"] = log_menu
         log_menu_btn.pack(side="left")
-        self._log_filter_var = StringVar(value="all")
-        ttk.Label(log_toolbar, text="筛选:", font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(8, 0))
-        for val, txt in [("all", "全部"), ("info", "信息"), ("warn", "警告"), ("error", "错误")]:
-            ttk.Radiobutton(log_toolbar, text=txt, variable=self._log_filter_var, value=val, command=self._filter_log).pack(side="left", padx=(2, 0))
-
-        shutdown_frame = ttk.Frame(log_toolbar)
-        shutdown_frame.pack(side="right", padx=(4, 0))
-        ttk.Checkbutton(shutdown_frame, text="🔌 完成关机", variable=self.auto_shutdown, command=self._on_auto_shutdown_toggle).pack(side="left")
+        log_menu.add_separator()
+        log_menu.add_checkbutton(label="任务完成后关机", variable=self.auto_shutdown, command=self._on_auto_shutdown_toggle)
 
         progress_frame = ttk.Frame(log_toolbar)
         progress_frame.pack(side="right", fill="x", expand=True, padx=(8, 0))
@@ -4120,7 +4122,7 @@ class TkImageBrowser:
         self._status_label.pack(side="left", fill="x", expand=True)
 
         log_frame = ttk.Frame(bottom)
-        log_frame.pack(fill="x")
+        self._log_frame = log_frame
         self.flow_log = tk.Text(log_frame, height=3, state="disabled", wrap="word", font=("Microsoft YaHei UI", 8), bg="#f6f7f9")
         self.flow_log.pack(side="left", fill="x", expand=True)
         log_scroll = ttk.Scrollbar(log_frame, command=self.flow_log.yview)
@@ -4142,7 +4144,7 @@ class TkImageBrowser:
         .action_bar（底部固定操作区），构建函数把可滚动内容放 .body、
         主操作按钮放 .action_bar；scrollable=False 时 .body 即面板本身。
         """
-        panel = ttk.Frame(self.panel_host, padding=8)
+        panel = ttk.Frame(self.center_content if key == "video" else self.panel_host, padding=8)
         self._panels[key] = panel
         if scrollable:
             bar = ttk.Frame(panel)
@@ -4171,21 +4173,84 @@ class TkImageBrowser:
         btn["menu"] = menu
         return btn
 
+    def _icon_button(self, parent, icon, command, tooltip, *, text="", style="Tool.TButton"):
+        button = ttk.Button(parent, image=self._icons.get(icon), text=text, compound="left", command=command, style=style)
+        if callable(tooltip):
+            ToolTip(button, text_func=tooltip)
+        else:
+            ToolTip(button, text=tooltip)
+        return button
+
+    def _build_tool_bar(self):
+        """顶部水平工具栏（原左侧竖栏迁移）。
+
+        保存 / 导入 / 导出统一走菜单与 Ctrl+S，自动保存常开，工具栏只保留编辑高频操作。
+        """
+        bar = self._tool_bar
+        self._icon_button(bar, "undo", self._edit_undo_pop, "撤销 · Ctrl+Z").pack(side="left", padx=2)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=3)
+        self._editor_tool_buttons = {}
+        for value, icon, color, text, tooltip in [
+            ("浏览", "hand", "#526176", "浏览", "浏览 / 平移 · V"),
+            ("选择 / 编辑", "select", "#526176", "编辑", "选择 / 编辑 · E"),
+            ("水平框 HBB", "rectangle", "#2563eb", "水平框", "绘制水平框 HBB · R / W"),
+            ("旋转框 OBB", "obb", "#8b5cf6", "旋转框", "绘制旋转框 OBB · O"),
+            ("多边形分割", "polygon", "#0d9488", "多边形", "绘制多边形 · P；双击或 Enter 闭合"),
+        ]:
+            button = ttk.Radiobutton(bar, image=self._icons.get(icon, color=color), text=text, compound="left",
+                                     variable=self.editor_tool_var, value=value,
+                                     style="Editor.TRadiobutton", command=self._editor_tool_changed)
+            button.pack(side="left", padx=2)
+            ToolTip(button, text=tooltip)
+            self._editor_tool_buttons[value] = button
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=3)
+        self._icon_button(bar, "fit", self._fit_from_toolbar, "适应窗口 · F").pack(side="left", padx=2)
+        eye = ttk.Checkbutton(bar, image=self._icons.get("eye"), variable=self.labels_visible,
+                              command=self.toggle_label_visibility, style="Toggle.TCheckbutton")
+        eye.pack(side="left", padx=2)
+        ToolTip(eye, text="显示 / 隐藏标注 · T")
+
+    def _fit_from_toolbar(self):
+        self._auto_fit.set(True)
+        self.fit_image()
+
     def _set_sash_positions(self) -> None:
-        if hasattr(self, "body"):
-            self.body.sashpos(0, self.root.winfo_width() - 400)
+        if not hasattr(self, "body"):
+            return
+        if len(self.body.panes()) < 2:
+            return
+        # body 只剩 中央画布 + 右栏；右栏内为 垂直分隔（参数面板 / 图片库）
+        self.body.sashpos(0, max(480, self.body.winfo_width() - 355))
+        if hasattr(self, "_right_paned") and str(self._library_pane) in self._right_paned.panes():
+            height = self._right_paned.winfo_height()
+            if height > 120:
+                self._right_paned.sashpos(0, max(180, height - 280))
 
     _PANEL_NAMES: dict[str, str] = {
-        "browse": "数据浏览",
-        "labels": "标签显示",
-        "marks": "标记转移",
+        "browse": "图片工作台",
+        "labels": "标签检查",
+        "marks": "分类整理",
         "video": "视频抽帧",
         "dedupe": "相似去重",
     }
 
     def show_panel(self, key: str) -> None:
+        if key == "workspace":
+            key = self._workspace_section
+        if key not in self._panels:
+            return
         if self._current_module == key:
             return
+        in_workspace = key in self.IMAGE_SECTIONS
+        if self._current_module in self.IMAGE_SECTIONS and not in_workspace:
+            if not self._resolve_pending_edits():
+                return
+            self._workspace_browse_state = (self.image_paths, self.current_index, self.current_image)
+        if in_workspace and self._current_module not in self.IMAGE_SECTIONS:
+            saved = getattr(self, "_workspace_browse_state", None)
+            if saved is not None:
+                self.image_paths, self.current_index, self.current_image = saved
+                self._edit_path = ""
         if self._current_module:
             self._save_module_state(self._current_module)
         for panel in self._panels.values():
@@ -4200,15 +4265,52 @@ class TkImageBrowser:
             "video": "#10b981",
             "dedupe": "#ef4444",
         }
+        if key == "video":
+            if str(self._inspector_pane) in self.body.panes():
+                self.body.forget(self._inspector_pane)
+            self._preview_nav.pack_forget()
+        else:
+            if str(self._inspector_pane) not in self.body.panes():
+                self.body.add(self._inspector_pane, weight=0)
+                self.root.after_idle(self._set_sash_positions)
+            self._preview_nav.pack(fill="x", pady=(0, 2), before=self.center_content)
+        if in_workspace:
+            self._workspace_section = key
+            self._tool_bar.pack(fill="x", before=self._work_area)
+            if str(self._library_pane) not in self._right_paned.panes():
+                self._right_paned.add(self._library_pane, weight=2)
+                self.root.after_idle(self._set_sash_positions)
+            self._inspector_tabs.pack(fill="x", pady=(0, 10), before=self._param_title_label)
+            self._image_tools.pack(side="right")
+        else:
+            self._tool_bar.pack_forget()
+            if str(self._library_pane) in self._right_paned.panes():
+                self._right_paned.forget(self._library_pane)
+                self.root.after_idle(self._set_sash_positions)
+            self._inspector_tabs.pack_forget()
+            self._image_tools.pack_forget()
+            if self.edit_mode_var.get():
+                self.edit_mode_var.set(False)
+                self._on_edit_mode_changed()
+        for section, button in self._section_buttons.items():
+            button.configure(style="Active.Inspector.TButton" if section == key else "Inspector.TButton")
         for nav_key, button in self._nav_buttons.items():
-            if nav_key == key:
+            if nav_key == ("browse" if in_workspace else key):
                 button.configure(style="Active.Nav.TButton")
                 button.widget_showing_active = True
             else:
                 button.configure(style="Nav.TButton")
                 button.widget_showing_active = False
         self._current_module = key
-        self._show_center_view("dedupe" if key == "dedupe" else "image")
+        self._show_center_view("dedupe" if key == "dedupe" else "video" if key == "video" else "image")
+        if in_workspace:
+            self.show_current_image()
+        elif key == "dedupe":
+            task_id = self._displayed_dedupe_task_id or self._active_dedupe_task_id
+            if task_id in self._dedupe_task_states:
+                self._display_dedupe_task(task_id)
+        elif key == "video":
+            self.image_info_var.set("设置任务 → 开始抽帧 → 返回工作台检查图片")
         self._restore_module_state(key)
         self._update_nav_buttons_for_module(key)
         self._update_dedupe_task_buttons()
@@ -4219,9 +4321,9 @@ class TkImageBrowser:
             _scroll.canvas.configure(scrollregion=_scroll.canvas.bbox("all"))
         name = self._PANEL_NAMES.get(key, key)
         if hasattr(self, "_module_title_var"):
-            self._module_title_var.set(name)
+            self._module_title_var.set("图片预览" if in_workspace else name)
         if hasattr(self, "_param_title_var"):
-            self._param_title_var.set(f"{name} - 参数设置")
+            self._param_title_var.set({"browse": "工作概览", "labels": "标签检查", "marks": "分类与转移"}.get(key, f"{name} · 任务"))
         self._append_module_log(key, f"[切换] 进入功能：{name}", show=True)
         self._save_config()
 
@@ -4239,16 +4341,18 @@ class TkImageBrowser:
             for btn in nav_buttons:
                 btn.state(["!disabled"])
                 try:
-                    btn.configure(text="◀ 上一张" if btn is self._prev_nav_btn else "下一张 ▶",
+                    btn.configure(text="",
                                   command=self.prev_image if btn is self._prev_nav_btn else self.next_image)
                 except tk.TclError:
                     pass
+            self._prev_nav_btn.state(["!disabled"] if self._navigation_target(-1) is not None else ["disabled"])
+            self._next_nav_btn.state(["!disabled"] if self._navigation_target(1) is not None else ["disabled"])
             return
         # 去重模块：上一组/下一组模式
         for btn in nav_buttons:
             btn.state(["!disabled"])
             try:
-                btn.configure(text="◀ 上一组" if btn is self._prev_nav_btn else "下一组 ▶",
+                btn.configure(text="",
                               command=self.prev_dedupe_task if btn is self._prev_nav_btn else self.next_dedupe_task)
             except tk.TclError:
                 pass
@@ -4275,16 +4379,19 @@ class TkImageBrowser:
         if prev_btn is None or next_btn is None:
             return
         if module == "dedupe":
-            prev_btn.configure(text="◀ 上一组", command=self.prev_dedupe_task)
-            next_btn.configure(text="下一组 ▶", command=self.next_dedupe_task)
+            prev_btn.configure(text="", command=self.prev_dedupe_task)
+            next_btn.configure(text="", command=self.next_dedupe_task)
         else:
-            prev_btn.configure(text="◀ 上一张", command=self.prev_image)
-            next_btn.configure(text="下一张 ▶", command=self.next_image)
+            prev_btn.configure(text="", command=self.prev_image)
+            next_btn.configure(text="", command=self.next_image)
 
     def _show_center_view(self, view: str) -> None:
         if not hasattr(self, "image_canvas_host"):
             return
-        if view == "dedupe":
+        if view == "video":
+            self.image_canvas_host.pack_forget()
+            self.dedupe_center.pack_forget()
+        elif view == "dedupe":
             self.image_canvas_host.pack_forget()
             self.dedupe_center.pack(fill="both", expand=True)
         else:
@@ -4406,42 +4513,13 @@ class TkImageBrowser:
         self._img_count_label.pack(side="left")
         self._cur_idx_label = ttk.Label(info_bar, text="当前: 0/0", font=("Microsoft YaHei UI", 8), foreground="#3b82f6")
         self._cur_idx_label.pack(side="left", padx=(12, 0))
-        ttk.Label(info_bar, textvariable=self.dir_var, font=("Microsoft YaHei UI", 7), foreground="#64748b", wraplength=250).pack(side="right", fill="x", expand=True, padx=(20, 0))
 
-        # 数据源区：图片目录 + GT/PRED 标签来源（X-AnyLabeling 风格合并布局）
-        ds = ttk.LabelFrame(tab, text="数据源", padding=(6, 4))
-        ds.pack(fill="x", pady=(0, 6))
-        ttk.Label(ds, text="图片目录", font=("Microsoft YaHei UI", 7)).pack(anchor="w")
-        ds_row1 = ttk.Frame(ds)
-        ds_row1.pack(fill="x")
-        self._dir_combo = ttk.Combobox(ds_row1, textvariable=self.dir_var, values=list(self._dir_history))
-        self._dir_combo.pack(side="left", fill="x", expand=True)
-        self._dir_combo.bind("<Return>", lambda _e: self.load_image_dir(self.dir_var.get()))
-        self._dir_combo.bind("<<ComboboxSelected>>", lambda _e: self.load_image_dir(self.dir_var.get()))
-        ttk.Button(ds_row1, text="浏览", command=self.open_image_dir, width=6, style="Action.TButton").pack(side="left", padx=(4, 0))
-        ttk.Checkbutton(ds_row1, text="递归", variable=self.recursive).pack(side="left", padx=(4, 0))
-        ToolTip(self._dir_combo, text_func=lambda: self.dir_var.get())
-
-        ttk.Label(ds, text="GT 标签目录", font=("Microsoft YaHei UI", 7)).pack(anchor="w")
-        ds_row2 = ttk.Frame(ds)
-        ds_row2.pack(fill="x")
-        self._label_dir_combo = ttk.Combobox(ds_row2, textvariable=self.label_dir_var, values=list(self._label_dir_history))
-        self._label_dir_combo.pack(side="left", fill="x", expand=True)
-        self._label_dir_combo.bind("<Return>", lambda _e: self._apply_label_dir_selection())
-        self._label_dir_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_label_dir_selection())
-        ttk.Button(ds_row2, text="浏览", command=self.select_label_dir, width=6).pack(side="left", padx=(4, 0))
-        ToolTip(self._label_dir_combo, text_func=lambda: self.label_dir_var.get())
-
-        ttk.Label(ds, text="PRED 预测标签目录（可选）", font=("Microsoft YaHei UI", 7)).pack(anchor="w")
-        ds_row3 = ttk.Frame(ds)
-        ds_row3.pack(fill="x")
-        self._pred_dir_combo = ttk.Combobox(ds_row3, textvariable=self.pred_label_dir_var, values=list(self._pred_dir_history))
-        self._pred_dir_combo.pack(side="left", fill="x", expand=True)
-        self._pred_dir_combo.bind("<Return>", lambda _e: self._apply_pred_dir_selection())
-        self._pred_dir_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_pred_dir_selection())
-        ttk.Button(ds_row3, text="浏览", command=self.select_pred_label_dir, width=6).pack(side="left", padx=(4, 0))
-        ttk.Button(ds_row3, text="清除", command=self._clear_pred_dir, width=6).pack(side="left", padx=(4, 0))
-        ToolTip(self._pred_dir_combo, text_func=lambda: self.pred_label_dir_var.get())
+        actions = ttk.LabelFrame(tab, text="接下来做什么", padding=10)
+        actions.pack(fill="x", pady=(0, 10))
+        ttk.Label(actions, text="图片已在左侧打开，点击列表即可预览。", style="Hint.TLabel", wraplength=285).pack(anchor="w", pady=(0, 8))
+        ttk.Button(actions, text="检查 / 修改标签", command=lambda: self.show_panel("labels")).pack(fill="x", pady=3)
+        ttk.Button(actions, text="标记分类 / 批量转移", command=lambda: self.show_panel("marks")).pack(fill="x", pady=3)
+        ttk.Label(actions, text="无需重复导入，同一图片可连续完成检查与整理。", style="Hint.TLabel", wraplength=285).pack(anchor="w", pady=(8, 0))
 
         stats_row = ttk.LabelFrame(tab, text="图片统计", padding=(6, 4))
         stats_row.pack(fill="x", pady=(0, 6))
@@ -4453,7 +4531,7 @@ class TkImageBrowser:
         ttk.Label(stats_inner, text="已标记:", font=("Microsoft YaHei UI", 7)).pack(side="left")
         self._marked_count_var2 = StringVar(value="0")
         ttk.Label(stats_inner, textvariable=self._marked_count_var2, font=("Microsoft YaHei UI", 7, "bold"), foreground="#f59e0b").pack(side="left", padx=(2, 12))
-        ttk.Label(stats_inner, text="已标记转移:", font=("Microsoft YaHei UI", 7)).pack(side="left")
+        ttk.Label(stats_inner, text="本次转移:", font=("Microsoft YaHei UI", 7)).pack(side="left")
         self._transfer_count_var = StringVar(value="0")
         ttk.Label(stats_inner, textvariable=self._transfer_count_var, font=("Microsoft YaHei UI", 7, "bold"), foreground="#10b981").pack(side="left", padx=(2, 0))
 
@@ -4463,169 +4541,60 @@ class TkImageBrowser:
         self._img_info_text.pack(fill="x")
 
     def _build_label_panel(self) -> None:
-        panel = self._register_panel("labels")
-        tab = panel.body
-        bar = panel.action_bar
-        ttk.Label(tab, text="标签显示", style="Title.TLabel").pack(anchor="w", pady=(0, 4))
-
-        # 自动识别格式（默认开启，无需手动设置格式/类型/坐标）
-        auto_row = ttk.Frame(tab)
-        auto_row.pack(fill="x", pady=(0, 4))
-        self.label_auto_var = BooleanVar(value=True)
-        def _on_auto_toggle():
-            if self.label_auto_var.get():
-                self.label_format_var.set("auto")
-                self.yolo_type_var.set("auto")
-                self.detect_box_format_var.set("auto")
-                self._manual_label_frame.pack_forget()
-            else:
-                self._manual_label_frame.pack(fill="x", pady=(0, 4), after=auto_row)
-            self.on_label_setting_changed()
-        auto_chk = ttk.Checkbutton(auto_row, text="自动识别格式", variable=self.label_auto_var, command=_on_auto_toggle)
-        auto_chk.pack(side="left")
-        self._detected_format_var = StringVar(value="")
-        ttk.Label(auto_row, textvariable=self._detected_format_var, font=("Microsoft YaHei UI", 7), foreground="#64748b").pack(side="left", padx=(8, 0))
-        # 新建框使用的类别（拖拽画框时应用）
-        ttk.Label(auto_row, text="画框类别", font=("Microsoft YaHei UI", 7)).pack(side="left", padx=(12, 2))
-        self._draw_class_combo = ttk.Combobox(auto_row, width=12, state="readonly", values=[])
-        self._draw_class_combo.pack(side="left")
-        self._draw_class_combo.bind("<<ComboboxSelected>>", self._on_draw_class_selected)
-
-        # 手动设置区域（自动识别关闭时显示）
-        manual_frame = ttk.Frame(tab)
-        manual_frame.pack(fill="x", pady=(0, 4))
-        self._manual_label_frame = manual_frame
-        ttk.Label(manual_frame, text="标签格式").pack(anchor="w")
-        fmt = ttk.Combobox(manual_frame, values=["auto", "yolo", "labelme", "coco"], textvariable=self.label_format_var, state="readonly")
-        fmt.pack(fill="x", pady=(0, 2))
-        fmt.bind("<<ComboboxSelected>>", lambda _e: self.on_label_setting_changed())
-        ttk.Label(manual_frame, text="YOLO 类型").pack(anchor="w")
-        yolo = ttk.Combobox(manual_frame, values=["auto", "detect", "obb", "segment"], textvariable=self.yolo_type_var, state="readonly")
-        yolo.pack(fill="x", pady=(0, 2))
-        yolo.bind("<<ComboboxSelected>>", lambda _e: self.on_label_setting_changed())
-        ttk.Label(manual_frame, text="检测框坐标").pack(anchor="w")
-        box_fmt = ttk.Combobox(
-            manual_frame,
-            values=["auto", "xywh", "xyxy"],
-            textvariable=self.detect_box_format_var,
-            state="readonly",
-        )
-        box_fmt.pack(fill="x", pady=(0, 2))
-        box_fmt.bind("<<ComboboxSelected>>", lambda _e: self.on_label_setting_changed())
-        # 默认隐藏手动设置
-        manual_frame.pack_forget()
-
-        # 导入/导出合并为下拉按钮（X-AnyLabeling 风格），固定在面板底部操作区
-        self._label_io_menubutton = ttk.Menubutton(bar, text="导入 / 导出 ▾", style="Action.TButton")
-        self._label_io_menubutton.pack(fill="x")
-        io_menu = tk.Menu(self._label_io_menubutton, tearoff=0)
-        io_menu.add_command(label="导入标签目录（GT）…", command=self.select_label_dir)
-        io_menu.add_command(label="重新导入标签", command=self.import_saved_labels)
-        io_menu.add_command(label="导入预测标签目录（PRED）…", command=self.select_pred_label_dir)
-        io_menu.add_command(label="导入 COCO JSON…", command=self.select_coco)
-        io_menu.add_command(label="导入类别文件（classes.txt）…", command=self.select_classes)
-        io_menu.add_separator()
-        io_menu.add_command(label="导出当前标签（YOLO）…", command=self.export_current_labels)
-        io_menu.add_command(label="批量导出全部标签（YOLO）…", command=self.export_all_labels)
-        io_menu.add_command(label="导出类别文件（classes.txt）…", command=self.export_classes)
-        self._label_io_menubutton.configure(menu=io_menu)
-        self._label_dir_label = ttk.Label(tab, text="", anchor="w", font=("Microsoft YaHei UI", 7))
-        self._label_dir_label.pack(fill="x", pady=(0, 4))
-        ToolTip(self._label_dir_label, text_func=lambda: self.label_dir_var.get())
-        classes_row = ttk.Frame(tab)
-        classes_row.pack(fill="x")
-        # 类别文件浏览已并入「导入 / 导出 ▾」菜单，目录行只保留输入框
-        self.classes_combo = ttk.Combobox(classes_row, textvariable=self.classes_file_var, values=self._classes_file_history)
-        self.classes_combo.pack(side="left", fill="x", expand=True)
-        self.classes_combo.bind("<<ComboboxSelected>>", self._on_classes_combo_selected)
-        ToolTip(self.classes_combo, text_func=lambda: self.classes_file_var.get())
-        self._coco_file_label = ttk.Label(tab, text="", anchor="w", font=("Microsoft YaHei UI", 7))
-        self._coco_file_label.pack(fill="x", pady=(0, 4))
-        ToolTip(self._coco_file_label, text_func=lambda: self.coco_file_var.get())
-        self.label_progress_frame = ttk.Frame(tab)
-        self.label_progress_frame.pack(fill="x", pady=(0, 4))
-        self.label_progress_var = tk.DoubleVar(value=0)
-        self.label_progress_bar = ttk.Progressbar(self.label_progress_frame, variable=self.label_progress_var, maximum=100, mode="determinate")
-        self.label_progress_bar.pack(side="left", fill="x", expand=True)
-        self.label_progress_text = ttk.Label(self.label_progress_frame, text="0/0", font=("Microsoft YaHei UI", 7), foreground="#64748b", width=10)
-        self.label_progress_text.pack(side="left", padx=(4, 0))
-        self.label_progress_frame.pack_forget()
-
-        ttk.Label(tab, text="标签匹配图片列表").pack(anchor="w")
-        tree_frame = ttk.Frame(tab)
-        tree_frame.pack(fill="x", pady=(0, 4))
-        self.label_tree = ttk.Treeview(tree_frame, columns=("status", "image", "label"), show="headings", height=8)
-        self.label_tree.heading("status", text="导入")
-        self.label_tree.heading("image", text="图片")
-        self.label_tree.heading("label", text="标签")
-        self.label_tree.column("status", width=48, anchor="center", stretch=False)
-        self.label_tree.column("image", width=130, anchor="w")
-        self.label_tree.column("label", width=150, anchor="w")
-        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.label_tree.yview, style="Wide.Vertical.TScrollbar")
-        self.label_tree.configure(yscrollcommand=tree_scroll.set)
-        tree_scroll.pack(side="right", fill="y")
-        self.label_tree.pack(side="left", fill="both", expand=True)
-        self.label_tree.bind("<Double-1>", self._on_label_tree_open)
-        # 当前行高亮样式
-        self.label_tree.tag_configure("current", background="#3b82f6", foreground="white")
-        self._add_class_filter_panel(tab, expand=True)
+        self._build_annotation_inspector()
 
     def _build_mark_panel(self) -> None:
         panel = self._register_panel("marks")
-        tab = panel.body
-        bar = panel.action_bar
-
-        header = ttk.Frame(tab)
-        header.pack(fill="x", pady=(0, 6))
-        self._mark_count_label = ttk.Label(header, text="待转移: 0 张", font=("Microsoft YaHei UI", 8), foreground="#64748b")
-        self._mark_count_label.pack(side="right")
-
-        ttk.Separator(tab).pack(fill="x", pady=6)
-
-        ttk.Label(tab, text="标记分类，一行一个", font=("Microsoft YaHei UI", 8)).pack(anchor="w")
-        self.category_text = tk.Text(tab, height=3, font=("Microsoft YaHei UI", 8))
+        tab, bar = panel.body, panel.action_bar
+        heading = ttk.Frame(tab)
+        heading.pack(fill="x", pady=(0, 8))
+        ttk.Label(heading, text="标记当前图片", style="Title.TLabel").pack(side="left")
+        editor = ttk.Frame(tab)
+        def manage():
+            if editor.winfo_manager():
+                editor.pack_forget()
+            else:
+                editor.pack(fill="x", after=heading, pady=(0, 10))
+        ttk.Button(heading, text="管理分类…", command=manage).pack(side="right")
+        self.category_text = tk.Text(editor, height=3, font=("Microsoft YaHei UI", 9), relief="solid", bd=1)
         self.category_text.pack(fill="x")
-        cats = self.config.get("categories") or ["漏检", "误检"]
-        self.category_text.insert("1.0", "\n".join(cats))
-        cat_btn_row = ttk.Frame(tab)
-        cat_btn_row.pack(fill="x", pady=4)
-        # 新建/删除/刷新三个低频操作收纳进「分类 ▾」下拉，命令不变
-        self._make_dropdown(cat_btn_row, "分类 ▾", [
-            ("新建分类标签", self._add_category_tag),
-            ("删除分类标签", self._delete_category_tag),
-            ("刷新分类按钮", self.refresh_mark_buttons),
-        ]).pack(side="left")
+        self.category_text.insert("1.0", "\n".join(self.config.get("categories") or ["漏检", "误检"]))
+        ttk.Label(editor, text="每行一个分类，点击应用后生效。", style="Hint.TLabel").pack(anchor="w", pady=4)
+        row = ttk.Frame(editor)
+        row.pack(fill="x")
+        ttk.Button(row, text="新增", command=self._add_category_tag).pack(side="left")
+        ttk.Button(row, text="删除分类", command=self._delete_category_tag).pack(side="left", padx=4)
+        def apply_categories():
+            self.refresh_mark_buttons()
+            self._save_config()
+            editor.pack_forget()
+        ttk.Button(row, text="应用", command=apply_categories).pack(side="right")
         self.mark_buttons = ttk.Frame(tab)
-        self.mark_buttons.pack(fill="x", pady=4)
-
-        ttk.Separator(tab).pack(fill="x", pady=6)
-
-        self._move_target_label = ttk.Label(tab, text="", anchor="w", font=("Microsoft YaHei UI", 7))
-        self._move_target_label.pack(fill="x", pady=(0, 4))
-        ToolTip(self._move_target_label, text_func=lambda: self.move_target_var.get())
-        ttk.Checkbutton(tab, text="保留原始子目录结构", variable=self.keep_structure).pack(anchor="w")
-
-        ttk.Label(tab, text="按标记类别批量转移", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(6, 0))
+        self.mark_buttons.pack(fill="x", pady=6)
+        ttk.Label(tab, text="再次点击可取消标记", style="Hint.TLabel").pack(anchor="w")
+        ttk.Checkbutton(tab, text="标记后下一张", variable=self.mark_auto_next_var, command=self._save_config).pack(anchor="w", pady=(8, 12))
+        ttk.Separator(tab).pack(fill="x", pady=8)
+        ttk.Label(tab, text="转移已标记的图片", style="Title.TLabel").pack(anchor="w", pady=(4, 8))
         self.batch_category_var = StringVar()
         self.batch_category_combo = ttk.Combobox(tab, textvariable=self.batch_category_var, state="readonly")
-        self.batch_category_combo.pack(fill="x", pady=4)
-
-        # 主操作唯一：批量转移固定在底部操作区；「更改目录」降级为行内 📁 浏览按钮（同一命令）
-        transfer_row = ttk.Frame(bar)
-        transfer_row.pack(fill="x")
-        ttk.Button(transfer_row, text="批量转移", command=self._select_target_and_transfer).pack(side="left", fill="x", expand=True)
-        ttk.Button(transfer_row, text="📁", command=self.select_move_target, width=4).pack(side="left", padx=(4, 0))
-
+        self.batch_category_combo.pack(fill="x")
+        self.batch_category_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_marked_images())
         self.marked_count_var = StringVar(value="待转移: 0 张")
-        ttk.Label(tab, textvariable=self.marked_count_var, font=("Microsoft YaHei UI", scale_font_size(8)), foreground="#64748b").pack(anchor="w", pady=(4, 0))
-
-        ttk.Separator(tab).pack(fill="x", pady=6)
-        self._add_class_filter_panel(tab, expand=True)
-
-        self.refresh_mark_buttons()
-        self._marked_images: list[str] = []
+        ttk.Label(tab, textvariable=self.marked_count_var, style="Hint.TLabel").pack(anchor="w", pady=8)
+        self._mark_count_label = ttk.Label(tab)  # 兼容统计更新；只显示上面的一份计数。
+        ttk.Label(tab, text="目标文件夹", style="Hint.TLabel").pack(anchor="w", pady=(8, 4))
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        ttk.Entry(row, textvariable=self.move_target_var, width=16).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="选择…", width=6, command=self.select_move_target).pack(side="left", padx=(4, 0))
+        self._move_target_label = ttk.Label(tab)  # 完整路径由输入框提供，不重复占用一行。
+        ttk.Checkbutton(tab, text="保留子目录结构", variable=self.keep_structure).pack(anchor="w", pady=8)
+        ttk.Label(bar, text="移动原图并同步标签，执行前核对数量。", style="Hint.TLabel", wraplength=285).pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="转移所选分类…", command=self._select_target_and_transfer, style="Action.TButton").pack(fill="x")
+        self._marked_images = []
         self._current_mark_index = 0
         self._total_marked_count = 0
+        self.refresh_mark_buttons()
 
     def _load_marked_images(self) -> None:
         category = self.batch_category_var.get()
@@ -4670,8 +4639,6 @@ class TkImageBrowser:
             self._mark_count_label.config(text=f"待转移: {len(self._marked_images)} 张")
         if hasattr(self, "_marked_count_var2"):
             self._marked_count_var2.set(str(len(self._marked_images)))
-        if hasattr(self, "_transfer_count_var"):
-            self._transfer_count_var.set(str(len(self._marked_images)))
 
     def _update_mark_count_display(self, delta: int = 0) -> None:
         self._total_marked_count = max(0, self._total_marked_count + delta)
@@ -4679,8 +4646,6 @@ class TkImageBrowser:
             self._marked_count_var2.set(str(self._total_marked_count))
         if hasattr(self, "_mark_count_label"):
             self._mark_count_label.config(text=f"待转移: {self._total_marked_count} 张")
-        if hasattr(self, "_transfer_count_var"):
-            self._transfer_count_var.set(str(self._total_marked_count))
 
     def _refresh_mark_count_from_files(self) -> None:
         total_marked = 0
@@ -4705,8 +4670,6 @@ class TkImageBrowser:
             self._marked_count_var2.set(str(total_marked))
         if hasattr(self, "_mark_count_label"):
             self._mark_count_label.config(text=f"待转移: {total_marked} 张")
-        if hasattr(self, "_transfer_count_var"):
-            self._transfer_count_var.set(str(total_marked))
 
     def _update_mark_transfer_preview(self) -> None:
         """已删除预览面板，此方法保留为空操作以兼容旧调用。"""
@@ -4793,6 +4756,7 @@ class TkImageBrowser:
     def _build_video_panel(self) -> None:
         tab = self._register_panel("video", scrollable=False)
         ttk.Label(tab, text="视频抽帧", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(tab, text="选择视频目录与输出目录，设置抽帧间隔后开始。阈值等参数可在高级设置中调整。", style="Hint.TLabel").pack(anchor="w", pady=(0, 8))
 
         # 底部按钮和统计标签先 pack（side=bottom），确保始终可见
         self.video_summary_var = StringVar(value="任务数: 1")
@@ -4835,10 +4799,20 @@ class TkImageBrowser:
         task_id = self._next_video_task_id
         self._next_video_task_id += 1
         task = VideoExtractTask(self.video_tasks_inner, task_id, self._on_video_task_update, self._on_video_task_delete, lambda: self.performance_mode.get())
+        ttk.Button(task.actions_row, text="查看输出图片", command=lambda t=task: self._open_video_output(t)).pack(side="left", padx=6)
         self.video_tasks.append(task)
         self._check_layout_mode()
         self.video_tasks_inner.update_idletasks()
         self.video_tasks_container.configure(scrollregion=self.video_tasks_container.bbox("all"))
+
+    def _open_video_output(self, task: VideoExtractTask) -> None:
+        folder = task.video_out_var.get()
+        if not folder or not Path(folder).is_dir():
+            self.notify_flow("[抽帧] 请先选择有效的输出目录")
+            return
+        if not task.flat_save_var.get():
+            self.recursive.set(True)
+        self.load_image_dir(folder)
 
     def _on_video_task_update(self, task_id: int, msg: str, progress: float | None) -> None:
         for task in self.video_tasks:
@@ -5258,8 +5232,9 @@ class TkImageBrowser:
             self._displayed_dedupe_task_id = 0
             self.dedupe_groups = []
             self.dedupe_selected = {}
-            self.image_paths = []
-            self.current_index = -1
+            if self._current_module == "dedupe":
+                self.image_paths = []
+                self.current_index = -1
             self._dedupe_summary_var.set("相似去重：未扫描")
             self._dedupe_current_var.set("")
             self.dedupe_canvas_view.set_message("任务已删除")
@@ -5325,17 +5300,14 @@ class TkImageBrowser:
         last_index = self.config.get("last_index", 0)
         self.notify_flow(f"[启动] 正在恢复上次目录: {dir_path}")
         if Path(dir_path).exists():
-            self.load_image_dir(dir_path)
-            if 0 < last_index < len(self.image_paths):
-                self.current_index = last_index - 1
-                self.show_current_image()
+            self.load_image_dir(dir_path, restore_index=last_index)
             self.refresh_current_labels(update_list=True)
             self._refresh_mark_count_from_files()
             if hasattr(self, "batch_category_combo") and self._categories():
                 self.batch_category_combo.set(self._categories()[0])
                 self._load_marked_images()
             self._update_mark_transfer_preview()
-            self.notify_flow(f"[启动] 已恢复任务，当前位置: 第 {last_index} 张图片")
+            self.notify_flow(f"[启动] 已恢复任务，当前位置: 第 {last_index + 1} 张图片")
         else:
             self.config["last_dir"] = ""
             self.config["last_index"] = 0
@@ -5437,7 +5409,8 @@ class TkImageBrowser:
         self._mark_btn_refs: dict[str, ttk.Button] = {}
         for i, cat in enumerate(cats):
             btn = ttk.Button(self.mark_buttons, text=cat, command=lambda c=cat: self.toggle_mark(c))
-            btn.pack(side="left", fill="x", expand=True, padx=(0 if i == 0 else 4, 0))
+            btn.grid(row=i // 2, column=i % 2, sticky="ew", padx=3, pady=3)
+            self.mark_buttons.columnconfigure(i % 2, weight=1)
             self._mark_btn_refs[cat] = btn
         self.batch_category_combo.configure(values=cats)
         if cats and self.batch_category_var.get() not in cats:
@@ -5545,7 +5518,7 @@ class TkImageBrowser:
         self.set_busy("[标签] 已启动后台匹配，界面可继续操作", 0)
         self.notify_flow(f"[标签] 后台匹配任务已提交，共 {len(paths)} 张图片")
         if hasattr(self, "label_progress_frame"):
-            self.label_progress_frame.pack(fill="x", pady=(0, 4), before=self.label_tree)
+            self.label_progress_frame.pack(fill="x", pady=(0, 4), before=self._label_tree_frame)
             self.label_progress_var.set(0)
             self.label_progress_text.config(text=f"0/{len(paths)}")
         if async_scan:
@@ -5603,20 +5576,28 @@ class TkImageBrowser:
     def _on_keypress(self, event: tk.Event) -> None:
         if self._focus_is_text_input():
             return
+        if self.root.focus_get() is self._library_tree:
+            return  # 列表方向键由 Treeview 处理，避免同时切图两次。
         key = (event.keysym or "").lower()
         char = (event.char or "").lower()
         ctrl = bool(event.state & 0x0004)
         # 标签编辑快捷键
         if key == "escape":
+            self._editor_cancel_drawing()
+            self.canvas.delete("polygon_preview")
             self._edit_sel = None
             self._focus_shape = None
             self.render_image()
             return
-        if key == "delete" and self._edit_sel is not None:
+        if key == "delete" and self.edit_mode_var.get() and self._edit_sel is not None:
             self._edit_delete_selected()
             return
-        if char == "z" and ctrl:
+        if key == "z" and ctrl and self.edit_mode_var.get():
             self._edit_undo_pop()
+            return
+        if not ctrl and self._current_module in self.IMAGE_SECTIONS and key in {"w", "r", "o", "p", "e", "v"}:
+            self.editor_tool_var.set({"w": "水平框 HBB", "r": "水平框 HBB", "o": "旋转框 OBB", "p": "多边形分割", "e": "选择 / 编辑", "v": "浏览"}[key])
+            self._editor_tool_changed()
             return
         if key == "left" or char == "a":
             self.prev_image()
@@ -5627,7 +5608,7 @@ class TkImageBrowser:
         elif char == "t":
             self.labels_visible.set(not self.labels_visible.get())
             self.toggle_label_visibility()
-        elif hasattr(self, 'dedupe_groups') and self.dedupe_groups and self.current_index >= 0:
+        elif self._current_module == "dedupe" and self.dedupe_groups and self.current_index >= 0:
             if char == "x" or key == "delete":
                 self._dedupe_transfer_and_next()
             elif char == "n":
@@ -5713,7 +5694,7 @@ class TkImageBrowser:
         if path:
             self.load_image_dir(path)
 
-    def load_image_dir(self, path: str) -> None:
+    def load_image_dir(self, path: str, restore_index: int = 0) -> None:
         """异步加载图片目录。
 
         - 立即把 dir_var 切到新路径（UI 同步更新）
@@ -5728,6 +5709,19 @@ class TkImageBrowser:
         if not root.exists() or not root.is_dir():
             self.set_busy("图片目录不存在，请重新选择", 0)
             return
+        if not self._resolve_pending_edits():
+            return
+        if self._current_module not in self.IMAGE_SECTIONS:
+            self.show_panel("workspace")
+        self._image_search_var.set("")
+        previous_root = getattr(self, "_loaded_image_root", "")
+        if previous_root and Path(previous_root).resolve() != root.resolve():
+            self.label_dir_var.set("")
+            self.pred_label_dir_var.set("")
+            self.coco_file_var.set("")
+            self.label_store.coco_file = ""
+            self.label_format_var.set("auto")
+            self.yolo_type_var.set("auto")
         # 1) 立即更新 UI 状态（label/状态栏）—— 这步在主线程，避免用户误以为没反应
         self.dir_var.set(path)
         self._add_history(self._dir_history, path)
@@ -5753,6 +5747,7 @@ class TkImageBrowser:
         # 2) 取消上一次未完成的扫描（如果有），避免结果错位
         scan_token = int(time.time() * 1000)
         self._dir_scan_token = scan_token
+        self._scan_start_index = max(0, restore_index)
 
         def _scan() -> None:
             try:
@@ -5795,12 +5790,19 @@ class TkImageBrowser:
             get_logger().info("忽略过期扫描结果 token=%s", scan_token)
             return
         self.image_paths = paths
+        self._loaded_image_root = self.dir_var.get()
+        self.label_store.image_root = self.dir_var.get()
+        self.current_image = None
+        self._edit_shapes = []
+        self._cur_extra_shapes = []
+        self._cur_pred_shapes = []
+        self._clear_canvas_items()
         self._image_cache.clear()
         self._photo_cache.clear()
         self._original_sizes.clear()
         self._file_sizes.clear()  # 清空旧目录的 size 缓存
         self.current_index = 0 if paths else -1
-        last_index = safe_int(self.config.get("last_index", 0), 0)
+        last_index = getattr(self, "_scan_start_index", 0)
         if 0 <= last_index < len(paths):
             self.current_index = last_index
         self.config["last_index"] = self.current_index
@@ -5845,13 +5847,28 @@ class TkImageBrowser:
         self._submit_background(_worker)
 
     def show_current_image(self) -> None:
+        path = self.image_paths[self.current_index] if 0 <= self.current_index < len(self.image_paths) else ""
+        if self._edit_dirty and self._edit_path and self._edit_path != path:
+            if not self._resolve_pending_edits():
+                if self._edit_path in self.image_paths:
+                    self.current_index = self.image_paths.index(self._edit_path)
+                    self._render_library_page(follow_current=True)
+                    self._update_image_info()
+                return
+        self._refresh_workspace()
         if not (0 <= self.current_index < len(self.image_paths)):
             self.current_image = None
-            self.canvas.delete("all")
+            self._clear_canvas_items()
+            self.canvas.delete("loading_hint")
             self.image_info_var.set("未加载图片")
+            self._update_overview()
             return
+        self._render_library_page(follow_current=True)
         self._highlight_label_tree_row()
         path = self.image_paths[self.current_index]
+        if self._edit_path != path:
+            self._editor_cancel_drawing()
+            self.canvas.delete("polygon_preview")
 
         # 切图前：自动保存上一张图片的标签修改（写回原 txt）
         if self._edit_dirty and self._edit_path and self._edit_path != path:
@@ -5869,6 +5886,12 @@ class TkImageBrowser:
             self._render_current_image(path)
             return
 
+        self.current_image = None
+        self._edit_shapes = []
+        self._cur_extra_shapes = []
+        self._cur_pred_shapes = []
+        self._clear_canvas_items()
+        self._show_canvas_loading_hint()
         self._loading_images.discard(path)
         self._loading_images.add(path)
         self._current_loading_path = path
@@ -5903,6 +5926,16 @@ class TkImageBrowser:
 
         self._image_loading = True
         self._submit_background(_load_image)
+
+    def _show_canvas_loading_hint(self) -> None:
+        """图片解码期间在画布中央显示「图片加载中…」，避免切图时空白无反馈。"""
+        self.canvas.delete("loading_hint")
+        self.set_busy("[图片] 正在加载图片…", None)
+        self.root.update_idletasks()
+        w = max(self.canvas.winfo_width(), 200)
+        h = max(self.canvas.winfo_height(), 150)
+        self.canvas.create_text(w // 2, h // 2, text="图片加载中…", fill="#8a8f98",
+                                font=("Microsoft YaHei UI", 12), tags="loading_hint")
 
     def _skip_corrupted_image(self, path: str, reason: str) -> None:
         if path in self.image_paths:
@@ -5964,6 +5997,7 @@ class TkImageBrowser:
             self._schedule_pre_render()
 
     def _render_current_image(self, path: str) -> None:
+        self.canvas.delete("loading_hint")
         # 1) 优先从缓存取 size；缓存未命中再 stat 一次（同步），下次切换就有了
         size = self._file_sizes.get(path)
         if size is None:
@@ -5984,6 +6018,7 @@ class TkImageBrowser:
             f"{self.current_index + 1}/{len(self.image_paths)}{group_info}  {Path(path).name}  "
             f"{orig_w}x{orig_h}  {size / 1024:.1f} KB"
         )
+        self._update_overview(path, orig_w, orig_h, size)
         if hasattr(self, "_index_entry"):
             self._index_entry.delete(0, "end")
             self._index_entry.insert(0, f"{self.current_index + 1}")
@@ -6227,9 +6262,10 @@ class TkImageBrowser:
             self._schedule_pre_render()
 
     def prev_image(self) -> None:
-        if self.current_index > 0:
+        target = self._navigation_target(-1)
+        if target is not None:
             self._cancel_pending_load()
-            self.current_index -= 1
+            self.current_index = target
             self._enter_fast_render_mode()
             if self._current_module == "dedupe":
                 self._focus_dedupe_image(self.image_paths[self.current_index])
@@ -6240,9 +6276,10 @@ class TkImageBrowser:
             self._save_config()
 
     def next_image(self) -> None:
-        if self.current_index < len(self.image_paths) - 1:
+        target = self._navigation_target(1)
+        if target is not None:
             self._cancel_pending_load()
-            self.current_index += 1
+            self.current_index = target
             self._enter_fast_render_mode()
             if self._current_module == "dedupe":
                 self._focus_dedupe_image(self.image_paths[self.current_index])
@@ -6386,7 +6423,7 @@ class TkImageBrowser:
         self._update_canvas_image()
 
         labels: list[LabelShape] = []
-        if self.labels_visible.get() and self._has_label_source() and 0 <= self.current_index < len(self.image_paths):
+        if (self._has_label_source() or self.pred_label_dir_var.get()) and 0 <= self.current_index < len(self.image_paths):
             self._sync_label_store_config()
             before = tuple(self.label_store.classes)
             try:
@@ -6442,10 +6479,11 @@ class TkImageBrowser:
         self._canvas_image_id = self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_image)
 
     def _load_labels_cached(self, path: str, size: tuple[int, int]) -> list[LabelShape]:
+        self.label_store.image_root = self.dir_var.get()
         cache_key = path
         if cache_key in self._label_cache:
             return self._label_cache[cache_key]
-        labels = self.label_store.load_for_image(path, size)
+        labels = self.label_store.load_for_image(path, size, include_hidden=True)
         if len(self._label_cache) >= self._label_cache_max:
             oldest_key = next(iter(self._label_cache))
             del self._label_cache[oldest_key]
@@ -6458,11 +6496,8 @@ class TkImageBrowser:
         - 配置了 PRED 目录：store 标签全部视为 gt，pred 另从 pred_store 读取
         - 未配置：带置信度的框视为 pred，其余视为 gt
         """
-        if self.pred_label_dir_var.get():
-            return labels, [], True
-        pred = [s for s in labels if s.confidence is not None]
-        gt = [s for s in labels if s.confidence is None]
-        return gt, pred, False
+        # 标签角色由来源决定，score 是属性，不代表 GT 不能编辑。
+        return labels, [], bool(self.pred_label_dir_var.get())
 
     def _load_pred_shapes(self, path: str, size: tuple[int, int]) -> list[LabelShape]:
         """从预测标签目录读取 pred 框（只读显示，类别表与 GT 共享）。"""
@@ -6491,7 +6526,7 @@ class TkImageBrowser:
         orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
         nx = (cx - self.pan_x) / max(orig_w * self.zoom, 1e-6)
         ny = (cy - self.pan_y) / max(orig_h * self.zoom, 1e-6)
-        return (max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny)))
+        return nx, ny
 
     def _dim_color(self, hex_color: str, factor: float = 0.85) -> str:
         """把颜色向画布背景色混合 factor 比例，得到淡化色（聚焦时淡化其余框）。"""
@@ -6541,14 +6576,15 @@ class TkImageBrowser:
         pred = self._load_pred_shapes(path, (orig_w, orig_h)) if pred_external else pred_from_store
         self._cur_gt_shapes = gt
         self._cur_pred_shapes = pred
-        self._cur_extra_shapes = [s for s in gt if s.kind != "detect"]
+        self._cur_extra_shapes = [s for s in gt if s.kind not in self.EDITABLE_KINDS]
         # 编辑会话中（当前图片有未保存修改）：保留内存编辑状态，
         # 避免撤销/删除/拖动后的重绘从标签缓存重新加载、覆盖编辑结果
         if self._edit_path == path and self._edit_dirty:
             editable = self._edit_shapes
         else:
-            editable = [s for s in gt if s.kind == "detect"]
+            editable = [s for s in gt if s.kind in self.EDITABLE_KINDS]
         self._edit_shapes = editable
+        gt = editable + self._cur_extra_shapes
         # 编辑选中的框若已不存在（切图等），清空选择
         if self._edit_sel is not None and self._edit_sel not in editable:
             self._edit_sel = None
@@ -6561,6 +6597,8 @@ class TkImageBrowser:
             draw_gt, draw_pred = False, True
         else:
             draw_gt, draw_pred = self.show_gt_var.get(), self.show_pred_var.get()
+        draw_gt = draw_gt and self.labels_visible.get()
+        draw_pred = draw_pred and self.labels_visible.get()
 
         used_text_rects: list[tuple[int, int, int, int]] = []
 
@@ -6610,6 +6648,8 @@ class TkImageBrowser:
             return coords
 
         def draw_shape(s: LabelShape, layer: str) -> None:
+            if self.label_store.active_classes is not None and s.class_id not in self.label_store.active_classes:
+                return
             color = self._label_color(s.class_id)
             if dim and s is not self._focus_shape:
                 color = self._dim_color(color)
@@ -6658,149 +6698,105 @@ class TkImageBrowser:
             for s in gt:
                 draw_shape(s, "gt")
 
-        # 选中框：白色高亮描边 + 8 个缩放手柄（4 角 + 4 边中点）
-        sel = self._edit_sel
-        if sel is not None and sel in editable:
-            coords = to_canvas_pts(sel)
-            if len(coords) >= 8:
-                hl_id = self.canvas.create_line(coords + coords[:2], fill="#ffffff", width=1)
-                self._handle_items.append(hl_id)
-                p = [(coords[i], coords[i + 1]) for i in range(0, 8, 2)]
-                mid = lambda a, b: ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
-                handles = [p[0], p[1], p[2], p[3], mid(p[0], p[1]), mid(p[1], p[2]), mid(p[2], p[3]), mid(p[3], p[0])]
-                for i, (hx, hy) in enumerate(handles):
-                    oid = self.canvas.create_oval(
-                        hx - 4, hy - 4, hx + 4, hy + 4,
-                        fill="#ffffff", outline=self._label_color(sel.class_id), width=1,
-                        tags=(f"handle{i}",),
-                    )
-                    self._handle_items.append(oid)
+        self._editor_draw_handles(self._edit_sel)
+        self._editor_sync_object_list()
+        self._editor_polygon_preview()
 
-    def _on_canvas_press(self, event: tk.Event) -> None:
-        """左键按下：手柄缩放 / 选中拖动 / 空白新建框，不做任何自动判断。"""
-        if not self.current_image:
-            return
-        mx, my = event.x, event.y
-        # 1) 已选中框的手柄命中 → 进入缩放模式
-        if self._edit_sel is not None and self._handle_items:
-            try:
-                hit = self.canvas.find_overlapping(mx - 3, my - 3, mx + 3, my + 3)
-            except tk.TclError:
-                hit = ()
-            for iid in reversed(hit):
-                if iid in self._handle_items:
-                    idx = -1
-                    for t in self.canvas.gettags(iid):
-                        if t.startswith("handle"):
-                            try:
-                                idx = int(t[len("handle"):])
-                            except ValueError:
-                                idx = -1
-                    if idx >= 0:
-                        self._edit_undo.append(self._edit_snapshot())
-                        self._edit_drag = {"mode": "resize", "handle": idx, "shape": self._edit_sel}
-                        return
-        # 2) 形状命中（框/文字/角点）→ 选择（gt detect 可编辑，pred 只读聚焦）
-        try:
-            hit = self.canvas.find_overlapping(mx - 2, my - 2, mx + 2, my + 2)
-        except tk.TclError:
-            hit = ()
-        shape = None
-        for iid in reversed(hit):
-            s = self._shape_item_map.get(iid)
-            if s is not None:
-                shape = s
-                break
-        if shape is not None:
-            self._focus_shape = shape
-            if shape.kind == "detect" and shape.confidence is None and shape in self._edit_shapes:
-                self._edit_sel = shape
-                self._edit_undo.append(self._edit_snapshot())
-                self._edit_drag = {
-                    "mode": "move",
-                    "shape": shape,
-                    "start_norm": self._canvas_to_norm(mx, my),
-                    "start_points": list(shape.points),
-                }
-            else:
-                self._edit_sel = None
-            self.render_image()
-            return
-        # 3) 空白：清除聚焦；有标签源则拖拽新建框，否则平移
-        if self._focus_shape is not None or self._edit_sel is not None:
-            self._focus_shape = None
-            self._edit_sel = None
-            self.render_image()
-        if self.labels_visible.get() and self._has_label_source():
-            self._edit_undo.append(self._edit_snapshot())
-            self._edit_drag = {"mode": "new", "x0": mx, "y0": my}
-            self._rubber_id = self.canvas.create_rectangle(mx, my, mx, my, outline="#ffffff", width=1, dash=(4, 4))
-        else:
-            self._edit_drag = {"mode": "pan", "x": mx, "y": my}
+    def _on_canvas_press(self, event):
+        self._editor_press(event)
 
-    def _on_canvas_drag(self, event: tk.Event) -> None:
-        if not self._edit_drag:
-            return
-        mode = self._edit_drag["mode"]
-        if mode == "pan":
-            dx = event.x - self._edit_drag["x"]
-            dy = event.y - self._edit_drag["y"]
-            self._edit_drag["x"], self._edit_drag["y"] = event.x, event.y
-            self.pan_x += dx
-            self.pan_y += dy
-            self.render_image()
-        elif mode == "new":
-            if self._rubber_id is not None:
-                self.canvas.coords(self._rubber_id, self._edit_drag["x0"], self._edit_drag["y0"], event.x, event.y)
-        elif mode == "move":
-            s = self._edit_drag["shape"]
-            nx, ny = self._canvas_to_norm(event.x, event.y)
-            sx, sy = self._edit_drag["start_norm"]
-            s.points = [(x + (nx - sx), y + (ny - sy)) for x, y in self._edit_drag["start_points"]]
-            self._edit_dirty = True
-            self.render_image()
-        elif mode == "resize":
-            s = self._edit_drag["shape"]
-            self._apply_handle_resize(s, self._edit_drag["handle"], self._canvas_to_norm(event.x, event.y))
-            self._edit_dirty = True
-            self.render_image()
+    def _on_canvas_drag(self, event):
+        self._editor_drag(event)
 
-    def _on_canvas_release(self, event: tk.Event) -> None:
-        drag = self._edit_drag
-        self._edit_drag = None
-        if not drag:
-            return
-        if drag["mode"] == "new":
-            x0, y0 = drag["x0"], drag["y0"]
-            if self._rubber_id is not None:
-                try:
-                    self.canvas.delete(self._rubber_id)
-                except tk.TclError:
-                    pass
-                self._rubber_id = None
-            # 拖动太小视为误操作，回退快照
-            if abs(event.x - x0) < 4 or abs(event.y - y0) < 4:
-                if self._edit_undo:
-                    self._edit_undo.pop()
-                return
-            nx0, ny0 = self._canvas_to_norm(min(x0, event.x), min(y0, event.y))
-            nx1, ny1 = self._canvas_to_norm(max(x0, event.x), max(y0, event.y))
-            cid = self._draw_class_id
-            shape = LabelShape(cid, self.label_store.class_name(cid), "detect", [(nx0, ny0), (nx1, ny0), (nx1, ny1), (nx0, ny1)])
-            self._edit_shapes.append(shape)
-            self._edit_sel = shape
-            self._focus_shape = shape
-            self._edit_dirty = True
-            self.render_image()
-        elif drag["mode"] == "move":
-            if drag["shape"].points != drag["start_points"]:
-                self._edit_dirty = True
+    def _on_canvas_release(self, event):
+        self._editor_release(event)
 
     def _on_canvas_pan_start(self, event: tk.Event) -> None:
         """右键按下：画布平移。"""
         if not self.current_image:
             return
         self._edit_drag = {"mode": "pan", "x": event.x, "y": event.y}
+
+    def _on_canvas_right_release(self, event: tk.Event) -> None:
+        """右键松开：拖动过 = 平移结束；原地松开 = 命中标注时弹出快捷菜单（改类别 / 删除）。"""
+        drag = self._edit_drag
+        self._edit_drag = None
+        if drag and drag.get("mode") == "pan" and (abs(event.x - drag["x"]) > 3 or abs(event.y - drag["y"]) > 3):
+            return
+        if not self.current_image:
+            return
+        hits = self.canvas.find_overlapping(event.x - 4, event.y - 4, event.x + 4, event.y + 4)
+        shape = next((self._shape_item_map[iid] for iid in reversed(hits) if iid in self._shape_item_map), None)
+        if shape is None or shape not in self._edit_shapes:
+            return
+        self._edit_sel = self._focus_shape = shape
+        self.render_image()
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"修改类别…（当前：{shape.class_name}）", command=self._editor_edit_class)
+        menu.add_separator()
+        menu.add_command(label="删除此标注", command=self._edit_delete_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _editor_tree_menu(self, event: tk.Event) -> str:
+        """标注列表右键：选中该行并弹出快捷菜单，删除不再需要先找按钮。"""
+        row = self._object_tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self._object_tree.selection_set(row)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="修改类别…", command=self._editor_edit_class)
+        menu.add_command(label="删除此标注", command=self._edit_delete_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _class_pick_dialog(self, title: str, current_class_id: int | None = None) -> int | None:
+        """类别选择对话框：下拉选择「序号·名称」，或直接输入序号 / 名称自动定位；输入新名称可创建类别。"""
+        classes = self.label_store.classes
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="下拉点选即确认；或输入序号 / 名称后回车；输入新名称将创建类别").pack(anchor="w", pady=(0, 6))
+        combo = ttk.Combobox(frame, state="normal", width=26,
+                             values=[f"{i}·{name}" for i, name in enumerate(classes)])
+        if current_class_id is not None and 0 <= current_class_id < len(classes):
+            combo.set(f"{current_class_id}·{classes[current_class_id]}")
+        combo.pack(fill="x")
+        combo.focus_set()
+        combo.select_range(0, "end")
+        hint = ttk.Label(frame, text="", style="Hint.TLabel")
+        hint.pack(anchor="w", pady=(4, 8))
+        result = {"cid": None}
+
+        def confirm(_event=None) -> None:
+            text = combo.get().strip()
+            cid = self._parse_draw_class_text(text)
+            if cid is None and text:
+                cid = self.label_store.class_id_for_name(text)
+            if cid is None:
+                hint.configure(text="无效输入：请下拉选择、输入序号或类别名称")
+                return
+            result["cid"] = cid
+            dialog.destroy()
+
+        def cancel(_event=None) -> None:
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="确定", command=confirm).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="取消", command=cancel).pack(side="right")
+        combo.bind("<Return>", confirm)
+        # 下拉点选（单击/双击）即确认，无需再点「确定」
+        combo.bind("<<ComboboxSelected>>", confirm)
+        dialog.bind("<Escape>", cancel)
+        dialog.update_idletasks()
+        dialog.geometry(f"+{self.root.winfo_rootx() + 120}+{self.root.winfo_rooty() + 160}")
+        dialog.wait_window()
+        return result["cid"]
 
     def _on_canvas_pan_move(self, event: tk.Event) -> None:
         if not self._edit_drag or self._edit_drag["mode"] != "pan":
@@ -6812,59 +6808,23 @@ class TkImageBrowser:
         self.pan_y += dy
         self.render_image()
 
-    def _on_canvas_double_click(self, _event: tk.Event) -> None:
-        """双击选中框：弹出类别下拉菜单换类。"""
-        if self._edit_sel is None or not self.label_store.classes:
-            return
-        menu = tk.Menu(self.canvas, tearoff=0, font=("Microsoft YaHei UI", 9))
-        for i, name in enumerate(self.label_store.classes):
-            menu.add_command(
-                label=f"[{i}] {name}",
-                command=lambda c=i: self._edit_set_class(c),
-            )
-        try:
-            menu.tk_popup(self.canvas.winfo_pointerx(), self.canvas.winfo_pointery())
-        finally:
-            menu.grab_release()
+    def _on_canvas_double_click(self, event):
+        if self.editor_tool_var.get() == "多边形分割":
+            self._editor_finish_polygon()
+        elif self.edit_mode_var.get():
+            self._editor_edit_class()
 
-    def _apply_handle_resize(self, s: LabelShape, handle_idx: int, npt: tuple[float, float]) -> None:
-        """按手柄调整 detect 框，归一化坐标钳制 [0,1] 后规范化为角点顺序。"""
-        pts = [list(p) for p in (s.points[:4] if len(s.points) >= 4 else s.points)]
-        while len(pts) < 4:
-            pts.append(list(pts[-1]))
-        if handle_idx < 4:
-            pts[handle_idx] = [npt[0], npt[1]]
-        elif handle_idx == 4:  # 上边中点
-            pts[0][1] = npt[1]
-            pts[1][1] = npt[1]
-        elif handle_idx == 5:  # 右边中点
-            pts[1][0] = npt[0]
-            pts[2][0] = npt[0]
-        elif handle_idx == 6:  # 下边中点
-            pts[2][1] = npt[1]
-            pts[3][1] = npt[1]
-        elif handle_idx == 7:  # 左边中点
-            pts[3][0] = npt[0]
-            pts[0][0] = npt[0]
-        xs = [max(0.0, min(1.0, p[0])) for p in pts]
-        ys = [max(0.0, min(1.0, p[1])) for p in pts]
-        x1, x2 = min(xs), max(xs)
-        y1, y2 = min(ys), max(ys)
-        s.points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    def _apply_handle_resize(self, shape, index, point):
+        self._editor_resize(shape, index, point)
 
-    def _edit_snapshot(self) -> list:
-        """当前可编辑框的快照（撤销栈用）。"""
-        return [(s.class_id, list(s.points), s.confidence) for s in list(self._edit_shapes)]
+    def _edit_snapshot(self):
+        return copy.deepcopy(self._edit_shapes)
 
-    def _edit_undo_pop(self) -> None:
+    def _edit_undo_pop(self):
         if not self._edit_undo:
             self.notify_flow("[编辑] 没有可撤销的操作")
             return
-        snap = self._edit_undo.pop()
-        self._edit_shapes = [
-            LabelShape(cid, self.label_store.class_name(cid), "detect", list(pts), conf)
-            for cid, pts, conf in snap
-        ]
+        self._edit_shapes = copy.deepcopy(self._edit_undo.pop())
         self._edit_sel = None
         self._focus_shape = None
         self._edit_dirty = True
@@ -6874,7 +6834,11 @@ class TkImageBrowser:
         if self._edit_sel is None or self._edit_sel not in self._edit_shapes:
             return
         self._edit_undo.append(self._edit_snapshot())
-        self._edit_shapes.remove(self._edit_sel)
+        if self._edit_sel.metadata.get("coco_rle"):
+            ann_id = self._edit_sel.metadata.get("coco_annotation", {}).get("id")
+            self._edit_shapes = [s for s in self._edit_shapes if s.metadata.get("coco_annotation", {}).get("id") != ann_id]
+        else:
+            self._edit_shapes.remove(self._edit_sel)
         self._edit_sel = None
         self._focus_shape = None
         self._edit_dirty = True
@@ -6895,9 +6859,7 @@ class TkImageBrowser:
         - 写回原标签文件绝对路径；无原文件按发现/新建规则落盘
         - obb/segment 原样保留；未启用 pred 目录时保留文件中带置信度的框
         """
-        if not force and not self._edit_dirty:
-            return
-        if not force and not self.auto_save_labels_var.get():
+        if not self._edit_dirty:
             return
         path = self._edit_path or (
             self.image_paths[self.current_index] if 0 <= self.current_index < len(self.image_paths) else ""
@@ -6907,17 +6869,41 @@ class TkImageBrowser:
         shapes = list(self._edit_shapes) + list(self._cur_extra_shapes)
         if not self.pred_label_dir_var.get():
             shapes += list(self._cur_pred_shapes)
-        label_root = self.label_dir_var.get() or None
-        target = self.label_store.get_source_path(path) or resolve_gt_save_path(path, label_root)
-        if write_yolo_label_file(target, shapes):
+        size = self._original_sizes.get(path)
+        if size is None:
+            with Image.open(path) as image:
+                size = image.size
+        fmt = self.label_store.effective_format()
+        source = self.label_store.get_source_path(path)
+        try:
+            if fmt == "coco":
+                target = Path(self.coco_file_var.get() or self.label_store.coco_file)
+                key = self.label_store.coco_key_for_image(path)
+                document = update_coco_image(self.label_store._coco_document, key, shapes, size, self.label_store.classes)
+                atomic_json(target, document)
+                self.label_store.load_coco(str(target))
+            elif fmt == "labelme":
+                target = source or (Path(self.label_dir_var.get()) / (Path(path).stem + ".json"))
+                document = labelme_document(path, size, shapes, target, self.label_store._labelme_documents.get(path))
+                atomic_json(target, document)
+                self.label_store._labelme_documents[path] = document
+            else:
+                target = source or resolve_gt_save_path(path, self.label_dir_var.get() or None)
+                if not write_yolo_label_file(target, shapes):
+                    raise OSError(f"无法写入 {target}")
+                # YOLO 四点 polygon 与 OBB 文本相同；记录本工具的形状类型供再次编辑。
+                schema_path = Path(self.label_dir_var.get() or target.parent) / ".annotation_types.json"
+                schema = json.loads(schema_path.read_text(encoding="utf-8")) if schema_path.exists() else {}
+                schema[str(target.relative_to(schema_path.parent))] = [shape.kind for shape in shapes]
+                atomic_json(schema_path, schema)
             self._edit_dirty = False
             self.label_store._label_cache.pop(path, None)
             self.label_store._source_by_image[path] = target
             self._label_cache.pop(path, None)
             self.notify_flow(f"[标签] 已保存 {len(shapes)} 个标注 → {target.name}")
             get_logger().info("标签已保存: %s (%d 个)", target, len(shapes))
-        else:
-            self.notify_flow(f"[标签] 保存失败：{target}")
+        except (OSError, ValueError, TypeError) as exc:
+            self.notify_flow(f"[标签] 保存失败：{exc}")
 
     def _save_all_dirty_labels(self) -> None:
         self._save_current_labels(force=True)
@@ -6961,37 +6947,9 @@ class TkImageBrowser:
         self.render_image()
 
     def select_label_dir(self) -> None:
-        self.log_label("等待选择标签目录")
-        path = filedialog.askdirectory(initialdir=self.label_dir_var.get() or None)
-        if not path:
-            self.log_label("已取消选择标签目录")
-            return
-        if not self.label_store.classes:
-            choice = messagebox.askyesno(
-                "类别命名方式",
-                "尚未导入 classes.txt。\n\n"
-                "• 是：自动递增命名（class_0、class_1 …）\n"
-                "• 否：打开文件选择 classes.txt\n\n"
-                "是否使用自动递增命名？",
-            )
-            if not choice:
-                self.log_label("用户选择导入 classes.txt")
-                self.select_classes()
-                return
-        self.label_store.clear_label_cache()
-        self._label_cache.clear()
-        self.log_label(f"已选择标签目录: {path}")
-        self.label_dir_var.set(path)
-        # 更新检测到的格式显示
-        if hasattr(self, "_detected_format_var"):
-            self.label_store.label_dir = path
-            fmt = self.label_store.effective_format()
-            self._detected_format_var.set(f"已识别: {fmt}")
-        self.log_label("开始导入标签目录")
-        self.refresh_current_labels(update_list=True)
-        self._add_history(self._label_dir_history, path)
-        self._refresh_history_combos()
-        self._save_config()
+        path = filedialog.askdirectory(title="选择 YOLO / LabelMe 标注目录", initialdir=self.label_dir_var.get() or None)
+        if path:
+            self._activate_annotation_source(Path(path))
 
     def _add_history(self, lst: list[str], path: str, max_n: int = 10) -> None:
         """路径加入历史列表（去重置顶，最多 max_n 条）。"""
@@ -7046,35 +7004,10 @@ class TkImageBrowser:
         self._apply_pred_dir_selection()
 
     def export_current_labels(self) -> None:
-        """导出当前图片的 GT 标签为归一化 YOLO txt（另存为）。"""
-        if not self.current_image or not (0 <= self.current_index < len(self.image_paths)):
-            messagebox.showinfo("提示", "未加载图片")
-            return
-        path = self.image_paths[self.current_index]
-        target = filedialog.asksaveasfilename(
-            title="导出当前标签",
-            defaultextension=".txt",
-            initialfile=f"{Path(path).stem}.txt",
-            initialdir=self.label_dir_var.get() or str(Path(path).parent),
-            filetypes=[("YOLO 标签", "*.txt"), ("所有文件", "*.*")],
-        )
-        if not target:
-            return
-        shapes = list(self._edit_shapes) + list(self._cur_extra_shapes)
-        if write_yolo_label_file(Path(target), shapes):
-            self.notify_flow(f"[导出] 已导出 {len(shapes)} 个标注 → {target}")
-        else:
-            messagebox.showerror("导出失败", f"无法写入: {target}")
+        self.show_annotation_export("当前图片")
 
     def export_all_labels(self) -> None:
-        """把当前图片列表的全部 GT 标签批量导出为归一化 YOLO txt + classes.txt。"""
-        if not self.image_paths:
-            messagebox.showinfo("提示", "当前没有图片")
-            return
-        out_dir = filedialog.askdirectory(title="选择导出目录")
-        if not out_dir:
-            return
-        self._run_thread(self._export_all_worker, out_dir)
+        self.show_annotation_export("全部图片")
 
     def _export_all_worker(self, out_dir: str) -> None:
         out = Path(out_dir)
@@ -7133,10 +7066,46 @@ class TkImageBrowser:
             messagebox.showerror("导出失败", str(exc))
 
     def _on_draw_class_selected(self, _e=None) -> None:
-        """画框类别下拉选择。"""
-        idx = self._draw_class_combo.current()
-        if idx >= 0:
-            self._draw_class_id = idx
+        """画框类别下拉选择 / 输入定位。
+
+        支持三种输入：直接输入序号（如 2）、「序号·名称」、精确类别名称；
+        回车或失焦生效，无效输入自动回显当前类别。
+        """
+        combo = self._draw_class_combo
+        text = combo.get().strip()
+        idx = self._parse_draw_class_text(text)
+        if idx is None:
+            current = combo.current()
+            idx = current if current >= 0 else self._draw_class_id
+        self._draw_class_id = idx
+        label = self._draw_class_label(idx)
+        if label and combo.get() != label:
+            combo.set(label)
+
+    def _draw_class_label(self, idx: int) -> str:
+        """类别序号 + 名称的规范显示文本。"""
+        classes = self.label_store.classes
+        if 0 <= idx < len(classes):
+            return f"{idx}·{classes[idx]}"
+        return ""
+
+    def _parse_draw_class_text(self, text: str) -> int | None:
+        """解析画框类别输入：纯数字=序号；「序号·名称」取序号；否则精确名称匹配。"""
+        if not text:
+            return None
+        classes = self.label_store.classes
+        if text.isdigit():
+            idx = int(text)
+            return idx if idx < len(classes) else None
+        if "·" in text:
+            head = text.split("·", 1)[0].strip()
+            if head.isdigit():
+                idx = int(head)
+                return idx if idx < len(classes) else None
+        try:
+            return list(classes).index(text)
+        except ValueError:
+            return None
 
     def _update_draw_class_combo(self) -> None:
         """类别表变化时同步画框类别下拉框。"""
@@ -7154,28 +7123,46 @@ class TkImageBrowser:
         """图片导入后自动探测 GT 标签目录（图片根/labels、图片根上级/labels），命中即自动配置。"""
         if not image_paths:
             return
+        if self.coco_file_var.get() and self.label_format_var.get() == "coco":
+            return
         probe = image_paths[:500]
         root = Path(self.dir_var.get()) if self.dir_var.get() else None
 
-        def hits_for(dir_path: Path) -> int:
-            return sum(1 for p in probe if (dir_path / (Path(p).stem + ".txt")).is_file())
-
-        candidates: list[Path] = []
-        if root:
-            candidates.append(root / "labels")
-            candidates.append(root.parent / "labels")
+        candidates = [root / "labels", root.parent / "labels", root] if root else []
         if self.label_dir_var.get():
-            candidates.append(Path(self.label_dir_var.get()))
-        best: Path | None = None
-        best_hits = 0
-        for c in candidates:
-            if c.is_dir():
-                n = hits_for(c)
-                if n > best_hits:
-                    best, best_hits = c, n
-        if best is None or best_hits == 0:
+            candidates.insert(0, Path(self.label_dir_var.get()))
+        best, best_hits, best_suffix = None, 0, ".txt"
+        for candidate in candidates:
+            if not candidate.is_dir():
+                continue
+            for suffix in [".json", ".txt"]:
+                hits = 0
+                for image_path in probe:
+                    image = Path(image_path)
+                    relative = image.relative_to(root) if root else Path(image.name)
+                    label = candidate / relative.with_suffix(suffix)
+                    if not label.is_file():
+                        label = candidate / (image.stem + suffix)
+                    if label.is_file():
+                        if suffix == ".json":
+                            try:
+                                if "shapes" not in json.loads(label.read_text(encoding="utf-8-sig")):
+                                    continue
+                            except (OSError, ValueError):
+                                continue
+                        hits += 1
+                if hits > best_hits:
+                    best, best_hits, best_suffix = candidate, hits, suffix
+        if best is None:
             return
-        self._bootstrap_classes_from_labels(best, probe)
+        self.label_format_var.set("labelme" if best_suffix == ".json" else "yolo")
+        self.label_store.coco_file = ""
+        self.coco_file_var.set("")
+        classes_path = best / "classes.txt"
+        if classes_path.is_file():
+            self._load_classes_from_path(str(classes_path), render=False)
+        elif best_suffix == ".txt":
+            self._bootstrap_classes_from_labels(best, probe)
         self.label_dir_var.set(str(best))
         # 把探测到的目录配置进标签引擎（与手动导入等效）
         self.label_store.configure(
@@ -7339,36 +7326,57 @@ class TkImageBrowser:
         self._save_config()
 
     def _add_class_filter_panel(self, parent: ttk.Frame, expand: bool) -> None:
-        ttk.Label(parent, text="类别过滤").pack(anchor="w")
-        frame = ScrollFrame(parent)
-        # 初始最小高度，_render_class_filter_frame 会按类数动态调整
-        frame.canvas.configure(height=120)
-        frame.pack(fill="both", expand=expand, pady=(0, 4))
-        self.class_filter_frames.append(frame)
-        self._render_class_filter_frame(frame)
+        """内嵌类别过滤条：与「当前图片的标注」合并展示，✓ = 显示该类别，点击切换。"""
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(2, 2))
+        ttk.Label(bar, text="显示类别", style="Hint.TLabel").pack(side="left", padx=(0, 6))
+        chips = ttk.Frame(bar)
+        chips.pack(side="left", fill="x", expand=True)
+        self.class_filter_frames.append(chips)
+        self._render_class_filter_frame(chips)
 
-    def _render_class_filter_frame(self, frame: ScrollFrame) -> None:
-        for child in frame.inner.winfo_children():
+    def _render_class_filter_frame(self, frame: ttk.Frame) -> None:
+        host = getattr(frame, "inner", frame)
+        for child in host.winfo_children():
             child.destroy()
+        # 芯片按估算宽度自动换行，适配右栏 350px 宽度
+        row = ttk.Frame(host)
+        row.pack(fill="x", anchor="w")
+        used = 0
         for class_id, cls in enumerate(self.label_store.classes):
-            row = ttk.Frame(frame.inner)
-            row.pack(fill="x", anchor="w", pady=1)
-            swatch = tk.Canvas(row, width=14, height=14, highlightthickness=0)
-            swatch.pack(side="left", padx=(0, 4))
+            active = bool(self.class_vars.get(cls) and self.class_vars[cls].get())
             color = self._label_color(class_id)
-            swatch.create_rectangle(1, 1, 13, 13, outline=color, fill="")
-            ttk.Checkbutton(
-                row,
-                text=cls,
-                variable=self.class_vars[cls],
-                command=self._on_class_filter_changed,
-            ).pack(side="left", fill="x", expand=True)
-        # 根据类数动态设置高度：每行约 24px，最小 120，最大 360（超出则滚动）
-        n = len(self.label_store.classes)
-        h = max(120, min(360, n * 24 + 8))
-        frame.canvas.configure(height=h)
-        frame.update_idletasks()
-        frame.canvas.configure(scrollregion=frame.canvas.bbox("all"))
+            text = f"✓ {class_id}·{cls}" if active else f"{class_id}·{cls}"
+            if active:
+                chip = tk.Label(row, text=text, background="#ffffff", foreground=color,
+                                highlightthickness=1, highlightbackground=color,
+                                padx=7, pady=1)
+            else:
+                chip = tk.Label(row, text=text, background="#ececee", foreground="#8a8f98",
+                                highlightthickness=1, highlightbackground="#d6d9dd",
+                                padx=7, pady=1)
+            used += len(text) * 12 + 22
+            chip.pack(side="left", padx=(0, 6), pady=1)
+            chip.bind("<Button-1>", lambda _e, c=cls: self._toggle_class_chip(c))
+            if used > 320:
+                row = ttk.Frame(host)
+                row.pack(fill="x", anchor="w")
+                used = 0
+        # 兼容旧的滚动容器（仅其需要动态高度）
+        if hasattr(frame, "canvas"):
+            n = len(self.label_store.classes)
+            h = max(120, min(360, n * 24 + 8))
+            frame.canvas.configure(height=h)
+            frame.update_idletasks()
+            frame.canvas.configure(scrollregion=frame.canvas.bbox("all"))
+
+    def _toggle_class_chip(self, cls: str) -> None:
+        var = self.class_vars.get(cls)
+        if var is None:
+            return
+        var.set(not var.get())
+        self._render_all_class_filter_frames()
+        self._on_class_filter_changed()
 
     def _render_all_class_filter_frames(self) -> None:
         for frame in getattr(self, "class_filter_frames", []):
@@ -7452,13 +7460,11 @@ class TkImageBrowser:
             return
         self.notify_flow(f"[标记] {action}: {category}")
         self._update_mark_count_display(delta)
+        self._load_marked_images()
         self._update_mark_button_states()
 
-        auto_next_categories = ["漏检", "误检", "used", "unused"]
-        if category in auto_next_categories and not was_marked and self.current_index < len(self.image_paths) - 1:
-            self.current_index += 1
-            self.show_current_image()
-            self._save_config()
+        if self.mark_auto_next_var.get() and not was_marked:
+            self.next_image()
 
     def select_move_target(self) -> None:
         path = filedialog.askdirectory(initialdir=self.move_target_var.get() or None)
@@ -8012,6 +8018,8 @@ class TkImageBrowser:
         self.dedupe_status_var.set(f"[相似去重] 已加载 {len(all_paths)} 张图片到图像查看区")
 
     def _display_dedupe_task(self, task_id: int) -> None:
+        if self._current_module != "dedupe":
+            return  # 后台完成只更新任务状态，不抢占正在检查的图片。
         state = self._dedupe_task_states.get(task_id)
         if not state:
             return
@@ -8335,7 +8343,16 @@ class TkImageBrowser:
 
     def _dispatch_queue_message(self, kind: str, payload: object) -> None:
         """单条 task_queue 消息的派发（拆出来便于加 try/except 隔离）。"""
-        if kind == "status":
+        if kind == "conversion_done":
+            self._show_conversion_result(*payload)
+        elif kind == "conversion_error":
+            self._conversion_running = False
+            self.notify_flow(f"[转换] 失败：{payload}")
+            messagebox.showerror("转换失败", str(payload), parent=self.root)
+        elif kind == "conversion_progress":
+            current, total = payload
+            self.notify_flow(f"[转换] 正在读取 {current}/{total}", current / max(total, 1) * 90)
+        elif kind == "status":
             self._update_module_status("browse", str(payload), None, log=True)
         elif kind == "progress":
             self._update_module_status("browse", None, float(payload))  # type: ignore[arg-type]
@@ -8519,6 +8536,8 @@ class TkImageBrowser:
         """关闭窗口：保存配置 → 停止后台调度 → 释放线程池 → 关闭 tk。"""
         if getattr(self, "_closing", False):
             return
+        if not self._resolve_pending_edits():
+            return
         self._closing = True
         self._dir_scan_token += 1
         self._current_loading_path = ""
@@ -8534,6 +8553,8 @@ class TkImageBrowser:
                 "_canvas_configure_after_id",
                 "_drain_after_id",
                 "_sash_after_id",
+                "_library_filter_after",
+                "_startup_restore_after_id",
             ):
                 aid = getattr(self, attr, None)
                 if aid is not None:
