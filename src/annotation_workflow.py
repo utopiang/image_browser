@@ -30,21 +30,14 @@ class AnnotationWorkflowMixin:
         layers.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(layers, text="人工标签 GT", variable=self.show_gt_var, command=self._on_display_option_changed).pack(side="left")
         ttk.Checkbutton(layers, text="预测 PRED", variable=self.show_pred_var, command=self._on_display_option_changed).pack(side="left", padx=6)
-        row = ttk.Frame(tab)
-        row.pack(fill="x", pady=(0, 8))
-        ttk.Label(row, text="绘制类别").pack(side="left", padx=(0, 8))
-        # 可输入状态下拉：既可下拉选择「序号·名称」，也可直接输入序号定位类别（回车/失焦生效）
-        self._draw_class_combo = ttk.Combobox(row, state="normal", width=12)
-        self._draw_class_combo.pack(side="left", fill="x", expand=True)
-        self._draw_class_combo.bind("<<ComboboxSelected>>", self._on_draw_class_selected)
-        self._draw_class_combo.bind("<Return>", self._on_draw_class_selected)
-        self._draw_class_combo.bind("<FocusOut>", self._on_draw_class_selected)
-        self._icon_button(row, "plus", self._editor_add_class, "添加标注类别").pack(side="left", padx=(4, 0))
+        ttk.Label(tab, text="实线：人工   虚线：预测   红色：待核对", style="Hint.TLabel").pack(anchor="w", pady=(0, 8))
+        self._selection_detail = tk.StringVar(value="选择标注查看详情")
+        ttk.Label(tab, textvariable=self._selection_detail, wraplength=280, style="Hint.TLabel").pack(fill="x", pady=(0, 6))
         ttk.Label(tab, text="当前图片的标注", style="Title.TLabel").pack(anchor="w", pady=(4, 5))
         listing = ttk.Frame(tab)
         listing.pack(fill="x")
         self._object_tree = ttk.Treeview(listing, columns=("class", "kind", "points"), show="headings", height=6, selectmode="browse")
-        for column, title, width in [("class", "类别", 140), ("kind", "类型", 60), ("points", "顶点", 45)]:
+        for column, title, width in [("class", "类别", 140), ("kind", "类型", 60), ("points", "来源", 45)]:
             self._object_tree.heading(column, text=title)
             self._object_tree.column(column, width=width, minwidth=35)
         scroll = ttk.Scrollbar(listing, command=self._object_tree.yview)
@@ -62,6 +55,8 @@ class AnnotationWorkflowMixin:
         self._icon_button(edit_actions, "tag", self._editor_edit_class, "修改选中标注的类别").pack(side="left")
         self._icon_button(edit_actions, "trash", self._edit_delete_selected, "删除选中标注 · Delete").pack(side="left", padx=4)
 
+        self._accept_prediction_button = self._icon_button(edit_actions, "accept", self._accept_prediction, "采纳预测为人工标注 · 可撤销", color="#16a34a")
+        self._confirm_review_button = ttk.Button(edit_actions, text="确认无误", command=self._confirm_review)
         sources = ttk.Frame(tab)
         toggle = ttk.Button(tab, text="来源与格式设置 ▸", image=self._icons.get("settings",size=18), compound="left")
         toggle.pack(fill="x", pady=(10, 4))
@@ -146,7 +141,7 @@ class AnnotationWorkflowMixin:
         if path:
             self._activate_annotation_source(Path(path))
 
-    def _activate_annotation_source(self, path):
+    def _activate_annotation_source(self, path, use_selected_classes=False):
         if not self._resolve_pending_edits():
             return
         try:
@@ -164,7 +159,7 @@ class AnnotationWorkflowMixin:
                 self.label_dir_var.set(str(folder))
                 self.yolo_type_var.set("auto")
                 classes = folder / "classes.txt"
-                if classes.exists():
+                if classes.exists() and not use_selected_classes:
                     self._load_classes_from_path(str(classes), render=False)
                 self._apply_label_dir_selection()
             else:
@@ -175,8 +170,10 @@ class AnnotationWorkflowMixin:
             self.show_panel("labels")
             self.refresh_current_labels(update_list=True)
             self._save_config()
+            return True
         except (OSError, ValueError, TypeError, KeyError) as exc:
             messagebox.showerror("导入失败", str(exc), parent=self.root)
+            return False
 
     def show_annotation_export(self, scope="全部图片"):
         if not self.image_paths:

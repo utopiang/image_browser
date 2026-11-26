@@ -19,9 +19,9 @@ import traceback
 from collections import defaultdict, OrderedDict
 from logging.handlers import RotatingFileHandler
 
-VERSION = "v1.0.24"
+VERSION = "v1.0.27"
 AUTHOR = "zhw"
-UPDATE_DATE = "2026-11-24"
+UPDATE_DATE = "2026-11-26"
 
 # ============ 日志子系统 ============
 # 目的：打包后的 exe（windowed 模式无控制台）也能在 logs/ 目录留下运行日志，
@@ -102,15 +102,12 @@ def _setup_logging() -> logging.Logger:
         except Exception:
             pass
 
-    # 3) 把版本日志（VERSION_LOG.md）复制成 logs/version.log，便于脱离源码目录查看
+    # Export the embedded release history for convenient diagnostics.
     try:
-        from version_log import find_version_log_file
-        src = find_version_log_file()
-        if src and src.exists():
-            content = src.read_text(encoding="utf-8")
-            (log_dir / "version.log").write_text(content, encoding="utf-8")
+        from version_log import EMBEDDED_VERSION_LOG
+        (log_dir / "version.log").write_text(EMBEDDED_VERSION_LOG, encoding="utf-8")
     except Exception as exc:
-        logger.debug("复制 version.log 失败: %s", exc)
+        logger.debug("写入 version.log 失败: %s", exc)
 
     # 启动横幅：把环境信息、版本号、关键开关写一行
     logger.info("=" * 60)
@@ -273,13 +270,10 @@ def _should_show_tutorial(config: dict) -> bool:
     """检查是否需要显示新手引导（首次启动或用户手动重置）。"""
     return not config.get("tutorial_seen", False)
 def _load_version_log() -> list[dict]:
-    """从 VERSION_LOG.md 加载版本日志（延迟加载，文件不存在返回空列表）。"""
+    """加载程序内置版本日志，不依赖外部文件。"""
     try:
-        from version_log import find_version_log_file, parse_version_log
-        path = find_version_log_file()
-        if path is None:
-            return []
-        entries = parse_version_log(path)
+        from version_log import get_all
+        entries = get_all()
         # 转为字典列表（避免 GUI 跨线程访问 dataclass 问题）
         return [
             {
@@ -304,6 +298,8 @@ from tkinter import ttk
 
 from PIL import Image, ImageTk
 try:
+    from .image_pipeline import ImagePipelineMixin
+    from .review_ui import ReviewUIMixin
     from .workspace import WorkspaceMixin
     from .annotation_editor import AnnotationEditorMixin
     from .annotation_workflow import AnnotationWorkflowMixin
@@ -311,6 +307,8 @@ try:
     from .annotation_formats import (LabelShape, AnnotationError, atomic_json, read_labelme,
         labelme_document, coco_shapes, shapes_to_coco, update_coco_image, convert_shape)
 except ImportError:  # 兼容直接从 src 导入 tk_app 的脚本
+    from src.image_pipeline import ImagePipelineMixin
+    from src.review_ui import ReviewUIMixin
     from workspace import WorkspaceMixin
     from annotation_editor import AnnotationEditorMixin
     from annotation_workflow import AnnotationWorkflowMixin
@@ -1016,6 +1014,8 @@ class LabelStore:
         self._format_cache_key = None
 
     def configure(self, label_format: str, yolo_type: str, label_dir: str, detect_box_format: str = "auto") -> None:
+        if (self.format, self.yolo_type, self.label_dir, self.detect_box_format) == (label_format, yolo_type, label_dir, detect_box_format):
+            return
         self.format = label_format
         self.yolo_type = yolo_type
         self.label_dir = label_dir
@@ -1156,7 +1156,9 @@ class LabelStore:
 
         self._label_cache[image_path] = list(labels)
         if len(self._label_cache) > self._label_cache_max:
-            self._label_cache.popitem(last=False)
+            evicted, _ = self._label_cache.popitem(last=False)
+            self._labelme_documents.pop(evicted, None)
+            self._source_by_image.pop(evicted, None)
 
         if self.active_classes is not None and not include_hidden:
             labels = [lb for lb in labels if lb.class_id in self.active_classes]
@@ -3471,7 +3473,7 @@ class TutorialOverlay:
             self.on_finish(completed)
 
 
-class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMixin):
+class TkImageBrowser(ImagePipelineMixin, ReviewUIMixin, AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMixin):
     # 类级别：保存所有活跃的 dedupe 缓存引用，进程崩溃时 excepthook 兜底刷盘
     _active_caches: list[DedupeCache] = []
 
@@ -3480,8 +3482,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if not visible:
             self.root.withdraw()
         self.root.title(f"图片筛选工具 {VERSION}")
-        self.root.geometry("1280x840")
-        self.root.minsize(1040, 700)
+        self.root.geometry("1440x900")
+        self.root.minsize(1180, 720)
 
         self.config = self._load_config()
         self.label_store = LabelStore()
@@ -3518,18 +3520,18 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._label_scan_id = 0
         self.labels_imported = False
         self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
-        self._cache_max = 200
+        self._cache_max = 1
         self._original_sizes: dict[str, tuple[int, int]] = {}
         self._preload_idx = -1
         self._preload_thread: threading.Thread | None = None
         self._loading_images: set[str] = set()
         self._closing = False
-        self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ImageLoader")
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ImageLoader")
         self._preload_in_progress = False
         self._current_loading_future = None
         self._image_loading = False
         self._photo_cache: dict[str, ImageTk.PhotoImage] = {}
-        self._photo_cache_max = 40
+        self._photo_cache_max = 4
         self._fast_render = False
         self._last_nav_time = 0.0
         self._quality_upgrade_after_id: str | None = None
@@ -3560,7 +3562,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._shape_item_map: dict[int, LabelShape] = {}  # canvas item id → shape（命中测试）
         self._handle_items: list[int] = []             # 选中框的 8 个手柄 item id
         self._rubber_id: int | None = None             # 新建框的橡皮筋 item id
-        self._draw_class_id = 0                        # 新建框使用的类别 id
+        self._draw_class_id = None                        # 新建框使用的类别 id
 
         # 历史记录（图片目录 / GT 标签目录 / PRED 标签目录，用于数据源下拉框）
         self._dir_history: list[str] = [p for p in self.config.get("dir_history", []) if p]
@@ -3568,6 +3570,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._pred_dir_history: list[str] = [p for p in self.config.get("pred_label_dir_history", []) if p]
 
         self._build_ui()
+        self._init_review_ui()
+        self._init_image_pipeline()
+        self._init_recovery(CONFIG_DIR / "recovery")
         # 路径变量变化时更新缩短显示
         self.label_dir_var.trace_add("write", lambda *_: self._update_path_labels())
         self.coco_file_var.trace_add("write", lambda *_: self._update_path_labels())
@@ -3672,11 +3677,10 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         log_text.tag_configure("separator", foreground="#cbd5e1")
         log_text.tag_configure("empty", font=("Microsoft YaHei UI", 9), foreground="#94a3b8")
 
-        # 加载版本日志（从 VERSION_LOG.md 文件）
+        # 加载内置版本日志
         entries = _load_version_log()
         if not entries:
-            log_text.insert("end", "未找到 VERSION_LOG.md 文件或文件为空。\n", "empty")
-            log_text.insert("end", "请确保该文件存在于程序同目录中。\n", "empty")
+            log_text.insert("end", "暂无版本日志。\n", "empty")
         else:
             for i, e in enumerate(entries):
                 log_text.insert("end", f"\n{e['version']}  ", "version")
@@ -3769,9 +3773,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         # 图片的唯一导入动作就是打开目录；标签来源属于标签检查。
         import_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="标签", menu=import_menu)
-        import_menu.add_command(label="导入标注文件（COCO / LabelMe）…", command=self.import_annotation_file)
-        import_menu.add_command(label="导入标注目录（YOLO / LabelMe）…", command=self.select_label_dir)
-        import_menu.add_command(label="导入预测标签目录（PRED）…", command=self.select_pred_label_dir)
+        import_menu.add_command(label="导入标签…", command=self.show_label_import)
         import_menu.add_command(label="导入类别文件（classes.txt）…", command=self.select_classes)
 
         # ---- 导出 ----
@@ -3880,7 +3882,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self.show_gt_var = BooleanVar(value=bool(self.config.get("show_gt", True)))
         self.show_pred_var = BooleanVar(value=bool(self.config.get("show_pred", True)))
         self._auto_fit = BooleanVar(value=True)
-        self.recursive = BooleanVar(value=bool(self.config.get("recursive", False)))
+        self.recursive = BooleanVar(value=bool(self.config.get("recursive", True)))
         self.keep_structure = BooleanVar(value=True)
         self.performance_mode = BooleanVar(value=bool(self.config.get("performance_mode", self.config.get("dedupe_performance_mode", False))))
         self.auto_shutdown = BooleanVar(value=False)
@@ -4001,7 +4003,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._module_title_var = StringVar(value="数据浏览")
         ttk.Label(header, textvariable=self._module_title_var, style="Title.TLabel").pack(side="left")
         self.image_info_var = StringVar(value="未加载图片")
-        ttk.Label(header, textvariable=self.image_info_var, anchor="e").pack(side="right")
+        self._image_header_info = ttk.Label(header, textvariable=self.image_info_var, anchor="w")
+        self._image_header_info.pack(side="left", padx=(16, 0), fill="x", expand=True)
 
         nav_below = ttk.Frame(center)
         self._preview_nav = nav_below
@@ -4093,8 +4096,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._build_video_panel()
         self._build_dedupe_panel()
         # 图片库挂到右栏下半区
-        self._build_library_panel(self._right_paned)
-        self._right_paned.add(self._library_pane, weight=2)
+        self._build_library_panel(self.body)
+        self.body.insert(0, self._library_pane, weight=0)
         self.show_panel("browse")
 
         bottom = ttk.Frame(main, padding=(6, 4))
@@ -4103,6 +4106,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         log_toolbar.pack(fill="x", pady=(0, 4))
         self._log_toggle_btn = ttk.Button(log_toolbar, text="展开日志", command=self._toggle_log_command)
         self._log_toggle_btn.pack(side="left", padx=(0, 6))
+        self._cancel_scan_button = ttk.Button(log_toolbar, text="取消扫描 / 导入", command=self._cancel_current_scan)
+        self._zoom_status = StringVar(value="缩放 100%")
+        ttk.Label(log_toolbar, textvariable=self._zoom_status, style="Hint.TLabel").pack(side="right", padx=8)
         # 历史记录/清空等低频操作收进「⋯」下拉，保持日志栏紧凑
         log_menu_btn = tk.Menubutton(log_toolbar, text="⋯", width=3, relief="flat",
                                      font=("Microsoft YaHei UI", 9, "bold"), direction="below")
@@ -4173,8 +4179,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         btn["menu"] = menu
         return btn
 
-    def _icon_button(self, parent, icon, command, tooltip, *, text="", style="Tool.TButton"):
-        button = ttk.Button(parent, image=self._icons.get(icon), text=text, compound="left", command=command, style=style)
+    def _icon_button(self, parent, icon, command, tooltip, *, text="", style="Tool.TButton", color="#526176"):
+        button = ttk.Button(parent, image=self._icons.get(icon, color=color), text=text, compound="left", command=command, style=style)
         if callable(tooltip):
             ToolTip(button, text_func=tooltip)
         else:
@@ -4219,12 +4225,13 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
             return
         if len(self.body.panes()) < 2:
             return
-        # body 只剩 中央画布 + 右栏；右栏内为 垂直分隔（参数面板 / 图片库）
-        self.body.sashpos(0, max(480, self.body.winfo_width() - 355))
-        if hasattr(self, "_right_paned") and str(self._library_pane) in self._right_paned.panes():
-            height = self._right_paned.winfo_height()
-            if height > 120:
-                self._right_paned.sashpos(0, max(180, height - 280))
+        width = self.body.winfo_width()
+        if hasattr(self, "_library_pane") and str(self._library_pane) in self.body.panes():
+            self.body.sashpos(0, 230)
+            if len(self.body.panes()) >= 3:
+                self.body.sashpos(1, max(610, width - 385))
+        else:
+            self.body.sashpos(0, max(480, width - 385))
 
     _PANEL_NAMES: dict[str, str] = {
         "browse": "图片工作台",
@@ -4277,15 +4284,15 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if in_workspace:
             self._workspace_section = key
             self._tool_bar.pack(fill="x", before=self._work_area)
-            if str(self._library_pane) not in self._right_paned.panes():
-                self._right_paned.add(self._library_pane, weight=2)
+            if str(self._library_pane) not in self.body.panes():
+                self.body.insert(0, self._library_pane, weight=0)
                 self.root.after_idle(self._set_sash_positions)
             self._inspector_tabs.pack(fill="x", pady=(0, 10), before=self._param_title_label)
             self._image_tools.pack(side="right")
         else:
             self._tool_bar.pack_forget()
-            if str(self._library_pane) in self._right_paned.panes():
-                self._right_paned.forget(self._library_pane)
+            if str(self._library_pane) in self.body.panes():
+                self.body.forget(self._library_pane)
                 self.root.after_idle(self._set_sash_positions)
             self._inspector_tabs.pack_forget()
             self._image_tools.pack_forget()
@@ -5509,8 +5516,12 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self.label_tree.delete(*self.label_tree.get_children())
         self._label_scan_id += 1
         scan_id = self._label_scan_id
+        self._label_scan_active = True
+        self._refresh_context_actions()
         paths = list(self.image_paths)
         if not paths:
+            self._label_scan_active = False
+            self._refresh_context_actions()
             self.set_busy("[标签] 当前没有图片可匹配", 100)
             self.log_label("当前没有图片可匹配")
             return
@@ -5530,6 +5541,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if not hasattr(self, "label_tree"):
             return
         self.labels_imported = False
+        self._label_scan_active = False
+        self._refresh_context_actions()
         self._label_scan_id += 1
         self.label_tree.delete(*self.label_tree.get_children())
         if message:
@@ -5540,7 +5553,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         matched = 0
         total = len(paths)
         for idx, image_path in enumerate(paths):
-            if scan_id != self._label_scan_id:
+            if self._closing or scan_id != self._label_scan_id:
                 return
             has_label, label_info = self.label_store.label_status_for_image(image_path)
             matched += int(has_label)
@@ -5747,11 +5760,14 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         # 2) 取消上一次未完成的扫描（如果有），避免结果错位
         scan_token = int(time.time() * 1000)
         self._dir_scan_token = scan_token
+        self._scan_active = True
+        self._refresh_context_actions()
         self._scan_start_index = max(0, restore_index)
+        scan_recursive = self.recursive.get()
 
         def _scan() -> None:
             try:
-                iterator = root.rglob("*") if self.recursive.get() else root.iterdir()
+                iterator = root.rglob("*") if scan_recursive else root.iterdir()
             except OSError as exc:
                 self.task_queue.put(("dir_scan_failed", (scan_token, str(exc))))
                 return
@@ -5759,6 +5775,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
             last_emit = 0.0
             try:
                 for idx, p in enumerate(iterator, 1):
+                    if self._closing or scan_token != self._dir_scan_token: return
                     try:
                         if p.is_file() and is_image(p):
                             raw.append(p)
@@ -5789,6 +5806,10 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if scan_token != getattr(self, "_dir_scan_token", scan_token):
             get_logger().info("忽略过期扫描结果 token=%s", scan_token)
             return
+        self._scan_active = False
+        self._refresh_context_actions()
+        self._invalidate_image_pipeline()
+        self._reset_review_dataset()
         self.image_paths = paths
         self._loaded_image_root = self.dir_var.get()
         self.label_store.image_root = self.dir_var.get()
@@ -5825,6 +5846,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
     def _apply_dir_scan_failed(self, scan_token: int, message: str) -> None:
         if scan_token != getattr(self, "_dir_scan_token", scan_token):
             return
+        self._scan_active = False
+        self._refresh_context_actions()
         get_logger().warning("目录扫描失败: %s", message)
         self.set_busy(f"[图片] {message}", 0)
         self.notify_flow(f"[图片] {message}")
@@ -5881,6 +5904,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._update_mark_button_states()
 
         if path in self._image_cache:
+            self._full_generation += 1
+            self._full_loader.invalidate()
+            self._image_loading = False
             self._image_cache.move_to_end(path)
             self.current_image = self._image_cache[path]
             self._render_current_image(path)
@@ -5892,40 +5918,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._cur_pred_shapes = []
         self._clear_canvas_items()
         self._show_canvas_loading_hint()
-        self._loading_images.discard(path)
-        self._loading_images.add(path)
-        self._current_loading_path = path
-        self._corrupted_skip_count = getattr(self, '_corrupted_skip_count', 0)
-
-        def _load_image():
-            if getattr(self, "_closing", False):
-                return
-            try:
-                with Image.open(path) as img:
-                    img.load()
-                    img_copy = img.convert("RGB")
-                    self._original_sizes[path] = (img_copy.width, img_copy.height)
-                
-                if getattr(self, '_current_loading_path', '') != path:
-                    self._loading_images.discard(path)
-                    return
-                
-                if path not in self._image_cache:
-                    self._image_cache[path] = img_copy
-                    if len(self._image_cache) > self._cache_max:
-                        self._image_cache.popitem(last=False)
-                self._loading_images.discard(path)
-                self._image_loading = False
-                if not getattr(self, "_closing", False):
-                    self.root.after(0, lambda: self._on_image_loaded(path))
-            except Exception as exc:
-                self._loading_images.discard(path)
-                self._image_loading = False
-                if not getattr(self, "_closing", False):
-                    self.root.after(0, lambda p=path, e=exc: self._skip_corrupted_image(p, str(e)))
-
-        self._image_loading = True
-        self._submit_background(_load_image)
+        if path in self._preview_cache:
+            self._display_slider_preview(self._preview_cache[path], "正在加载清晰图片…")
+        self._load_current_original(path)
 
     def _show_canvas_loading_hint(self) -> None:
         """图片解码期间在画布中央显示「图片加载中…」，避免切图时空白无反馈。"""
@@ -6025,79 +6020,20 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if hasattr(self, "_total_label"):
             self._total_label.config(text=f" / {len(self.image_paths)}")
         if hasattr(self, "image_slider_scale") and len(self.image_paths) > 1:
-            self.image_slider_scale.set(self.current_index / max(len(self.image_paths) - 1, 1) * 1000)
+            self._setting_slider = True
+            try:
+                self.image_slider_scale.set(self.current_index / max(len(self.image_paths) - 1, 1) * 1000)
+            finally:
+                self._setting_slider = False
         if self._auto_fit.get():
             self.fit_image()
         else:
             self.render_image()
+        self._offer_recovery_draft(path)
         self._preload_surrounding()
 
-    def _preload_surrounding(self, extend_range: int = 50) -> None:
-        if getattr(self, "_closing", False):
-            return
-        total = len(self.image_paths)
-        if total <= 1:
-            return
-
-        preload_indices = []
-        for offset in range(extend_range + 1):
-            if offset == 0:
-                continue
-            idx_a = self.current_index - offset
-            idx_b = self.current_index + offset
-            if 0 <= idx_a < total:
-                preload_indices.append(idx_a)
-            if 0 <= idx_b < total:
-                preload_indices.append(idx_b)
-            if len(preload_indices) >= 100:
-                break
-
-        if not preload_indices:
-            return
-
-        target_w, target_h = self._get_preload_target_size()
-
-        def _load_single(idx: int) -> None:
-            if getattr(self, "_closing", False):
-                return
-            path = self.image_paths[idx]
-            if path in self._image_cache or path in self._loading_images:
-                return
-            self._loading_images.add(path)
-            try:
-                with Image.open(path) as img:
-                    img.load()
-                    img_rgb = img.convert("RGB")
-                    img_w, img_h = img_rgb.size
-                    self._original_sizes[path] = (img_w, img_h)
-                    if img_w > target_w or img_h > target_h:
-                        ratio = min(target_w / img_w, target_h / img_h)
-                        new_w = int(img_w * ratio)
-                        new_h = int(img_h * ratio)
-                        img_copy = img_rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
-                    else:
-                        img_copy = img_rgb
-                if path not in self._image_cache:
-                    self._image_cache[path] = img_copy
-                    if len(self._image_cache) > self._cache_max:
-                        self._image_cache.popitem(last=False)
-                self._loading_images.discard(path)
-            except Exception:
-                self._loading_images.discard(path)
-
-        for i, idx in enumerate(preload_indices):
-            if i >= 4:
-                break
-            self._submit_background(_load_single, idx)
-
-        remaining = preload_indices[4:]
-        if remaining:
-            def _load_remaining():
-                for idx in remaining:
-                    if getattr(self, "_closing", False):
-                        return
-                    _load_single(idx)
-            self._submit_background(_load_remaining)
+    def _preload_surrounding(self, extend_range: int = 1) -> None:
+        self._schedule_nearby_previews()
 
     def _get_preload_target_size(self) -> tuple[int, int]:
         if self._cached_preload_size is not None:
@@ -6117,102 +6053,10 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._pre_render_after_id = self.root.after_idle(self._pre_render_photo_images)
 
     def _pre_render_photo_images(self) -> None:
-        """主线程上做调度：把候选列表 + 目标尺寸交给后台线程跑 resize 和 PhotoImage。
-
-        性能要点：
-        - resize 在后台线程跑（CPU 密集）
-        - ImageTk.PhotoImage 也在后台线程生成（PIL >= 9 内部用 C 实现，线程安全）
-        - 每轮最多 6 张，到时间就再 schedule 一轮，避免长任务卡 UI
-        - 当前图片和 ±1 必出（切换时 < 50ms 命中）
-        """
+        # Tk PhotoImage objects must only be created on the UI thread.
         self._pre_render_after_id = None
-        if not self._auto_fit.get() or not self.image_paths:
-            return
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        if cw <= 100 or ch <= 100:
-            return
 
-        # 按"距离当前越近越优先"排好候选
-        candidates: list[tuple[int, int]] = []  # (distance, idx)
-        for offset in range(0, 25):
-            for idx in (self.current_index + offset, self.current_index - offset):
-                if 0 <= idx < len(self.image_paths):
-                    candidates.append((abs(offset), idx))
-        if not candidates:
-            return
 
-        BATCH = 6
-        targets: list[int] = []
-        for _, idx in candidates:
-            if len(targets) >= BATCH:
-                break
-            path = self.image_paths[idx]
-            # 提前算 cache_key，命中就跳过
-            img = self._image_cache.get(path)
-            if img is None:
-                continue
-            orig_w, orig_h = self._original_sizes.get(path, (img.width, img.height))
-            zoom = min(cw / orig_w, ch / orig_h, 1.0)
-            w = max(1, int(orig_w * zoom))
-            h = max(1, int(orig_h * zoom))
-            cache_key = f"{path}@{w}x{h}"
-            if cache_key in self._photo_cache:
-                continue
-            targets.append(idx)
-
-        if not targets:
-            return
-
-        def _worker(target_idxs: list[int]) -> None:
-            for idx in target_idxs:
-                if getattr(self, "_closing", False):
-                    return
-                if not (0 <= idx < len(self.image_paths)):
-                    continue
-                path = self.image_paths[idx]
-                img = self._image_cache.get(path)
-                if img is None:
-                    continue
-                orig_w, orig_h = self._original_sizes.get(path, (img.width, img.height))
-                zoom = min(cw / orig_w, ch / orig_h, 1.0)
-                w = max(1, int(orig_w * zoom))
-                h = max(1, int(orig_h * zoom))
-                cache_key = f"{path}@{w}x{h}"
-                if cache_key in self._photo_cache:
-                    continue
-                try:
-                    display = img.resize((w, h), Image.Resampling.BILINEAR)
-                    photo = ImageTk.PhotoImage(display)
-                    self._photo_cache[cache_key] = photo
-                    if len(self._photo_cache) > self._photo_cache_max:
-                        oldest_key = next(iter(self._photo_cache))
-                        del self._photo_cache[oldest_key]
-                except Exception:
-                    pass
-
-        # 提交到执行器，不阻塞主线程
-        self._submit_background(_worker, targets)
-        # 继续下一轮（如果还有候选）
-        if not getattr(self, "_closing", False) and len(targets) == BATCH and any(True for _, idx in candidates[BATCH:]):
-            self._pre_render_after_id = self.root.after(30, self._pre_render_photo_images)
-
-    def _on_image_scale_change(self, value: str) -> None:
-        if not self.image_paths:
-            return
-        total = len(self.image_paths)
-        if total <= 1:
-            return
-        target_index = int(float(value) / 1000 * (total - 1) + 0.5)
-        target_index = max(0, min(target_index, total - 1))
-        if target_index != self.current_index:
-            self.current_index = target_index
-            if self._current_module == "dedupe":
-                self._focus_dedupe_image(self.image_paths[self.current_index])
-            else:
-                self.show_current_image()
-            self._preload_surrounding()
-            self._schedule_pre_render()
 
     def _on_global_index_enter(self, event: tk.Event) -> None:
         try:
@@ -6245,21 +6089,6 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if hasattr(self, "_total_label"):
             self._total_label.config(text=f" / {len(self.image_paths)}")
 
-    def _on_image_slider_changed(self, value: int, max_val: float) -> None:
-        if not self.image_paths:
-            return
-        total = len(self.image_paths)
-        if total <= 1:
-            return
-        target_index = int((value / max_val) * (total - 1))
-        if 0 <= target_index < total and target_index != self.current_index:
-            self.current_index = target_index
-            if self._current_module == "dedupe":
-                self._focus_dedupe_image(self.image_paths[self.current_index])
-            else:
-                self.show_current_image()
-            self._preload_surrounding()
-            self._schedule_pre_render()
 
     def prev_image(self) -> None:
         target = self._navigation_target(-1)
@@ -6307,6 +6136,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
 
     def _cancel_pending_load(self) -> None:
         self._current_loading_path = ""
+        if hasattr(self, "_full_loader"):
+            self._full_generation += 1
+            self._full_loader.invalidate()
 
     def _on_canvas_configure(self, _event: tk.Event | None = None) -> None:
         if self._canvas_configure_after_id is not None:
@@ -6400,27 +6232,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         orig_w, orig_h = self._original_sizes.get(path, (self.current_image.width, self.current_image.height))
         w = max(1, int(orig_w * self.zoom))
         h = max(1, int(orig_h * self.zoom))
-        cache_key = f"{path}@{w}x{h}"
-
-        if cache_key in self._photo_cache:
-            self.tk_image = self._photo_cache[cache_key]
-        else:
-            resample = Image.Resampling.BILINEAR if self._fast_render else Image.Resampling.LANCZOS
-            try:
-                if self.current_image.width == w and self.current_image.height == h:
-                    display = self.current_image
-                else:
-                    display = self.current_image.resize((w, h), resample)
-            except Exception as exc:
-                self.notify_flow(f"[图片] 渲染失败: {exc}")
-                return 0
-            self.tk_image = ImageTk.PhotoImage(display)
-            self._photo_cache[cache_key] = self.tk_image
-            if len(self._photo_cache) > self._photo_cache_max:
-                oldest_key = next(iter(self._photo_cache))
-                del self._photo_cache[oldest_key]
-
-        self._update_canvas_image()
+        self._request_viewport(path, (orig_w, orig_h))
+        if hasattr(self, "_zoom_status"):
+            self._zoom_status.set(f"缩放 {self.zoom:.0%}" + (" · 未保存" if self._edit_dirty else " · 已保存"))
 
         labels: list[LabelShape] = []
         if (self._has_label_source() or self.pred_label_dir_var.get()) and 0 <= self.current_index < len(self.image_paths):
@@ -6442,6 +6256,9 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         return len(labels)
 
     def _clear_canvas_items(self) -> None:
+        self._viewport_key = None
+        self._viewport_requested = None
+        self._overlay_pool = {}
         if self._canvas_image_id is not None:
             try:
                 self.canvas.delete(self._canvas_image_id)
@@ -6504,19 +6321,22 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         pred_dir = self.pred_label_dir_var.get()
         if not pred_dir:
             return []
-        self.pred_store.classes = list(self.label_store.classes)
-        if (
-            self.pred_store.label_dir != pred_dir
-            or self.pred_store.yolo_type != self.yolo_type_var.get()
-            or self.pred_store.detect_box_format != self.detect_box_format_var.get()
-        ):
-            self.pred_store.configure(
-                self.label_format_var.get(),
-                self.yolo_type_var.get(),
-                pred_dir,
-                self.detect_box_format_var.get(),
-            )
-        return self.pred_store.load_for_image(path, size)
+        self.pred_store.image_root = self.dir_var.get()
+        if Path(pred_dir).is_file():
+            if self.pred_store.coco_file != pred_dir:
+                self.pred_store.load_coco(pred_dir)
+            # COCO categories keep their source ids; map by name to the shared table.
+            result = self.pred_store.load_for_image(path, size, include_hidden=True)
+        else:
+            self.pred_store.classes = list(self.label_store.classes)
+            if self.pred_store.label_dir != pred_dir or self.pred_store.coco_file:
+                self.pred_store.coco_file = ""
+                self.pred_store.configure("auto", self.yolo_type_var.get(), pred_dir, self.detect_box_format_var.get())
+                self.pred_store._label_cache.clear()
+            result = self.pred_store.load_for_image(path, size, include_hidden=True)
+        for shape in result:
+            shape.class_id = self.label_store.class_id_for_name(shape.class_name)
+        return result
 
     def _canvas_to_norm(self, cx: float, cy: float) -> tuple[float, float]:
         """画布像素坐标 → 归一化坐标 [0,1]（按当前 zoom/pan）。"""
@@ -6543,11 +6363,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
     def _draw_labels(self, labels: list[LabelShape]) -> None:
         if not self.current_image:
             return
-        for lid in self._canvas_label_ids:
-            try:
-                self.canvas.delete(lid)
-            except tk.TclError:
-                pass
+        self._overlay_used = set()
         for lid in self._canvas_label_text_ids:
             try:
                 self.canvas.delete(lid)
@@ -6558,7 +6374,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 self.canvas.delete(hid)
             except tk.TclError:
                 pass
-        if self._rubber_id is not None:
+        if self._rubber_id is not None and not (self._edit_drag and self._edit_drag.get("mode") == "new"):
             try:
                 self.canvas.delete(self._rubber_id)
             except tk.TclError:
@@ -6576,7 +6392,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         pred = self._load_pred_shapes(path, (orig_w, orig_h)) if pred_external else pred_from_store
         self._cur_gt_shapes = gt
         self._cur_pred_shapes = pred
-        self._cur_extra_shapes = [s for s in gt if s.kind not in self.EDITABLE_KINDS]
+        if not (self._edit_path == path and self._edit_dirty):
+            self._cur_extra_shapes = [s for s in gt if s.kind not in self.EDITABLE_KINDS]
         # 编辑会话中（当前图片有未保存修改）：保留内存编辑状态，
         # 避免撤销/删除/拖动后的重绘从标签缓存重新加载、覆盖编辑结果
         if self._edit_path == path and self._edit_dirty:
@@ -6591,6 +6408,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if self._focus_shape is not None and self._focus_shape not in gt and self._focus_shape not in pred:
             self._focus_shape = None
 
+        self._update_review_comparison(gt, pred, path)
         dim = self._focus_shape is not None
         # 按住 Tab：临时独显 PRED 层；否则按开关显示
         if self._tab_pred_only:
@@ -6599,44 +6417,6 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
             draw_gt, draw_pred = self.show_gt_var.get(), self.show_pred_var.get()
         draw_gt = draw_gt and self.labels_visible.get()
         draw_pred = draw_pred and self.labels_visible.get()
-
-        used_text_rects: list[tuple[int, int, int, int]] = []
-
-        def overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
-            return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
-
-        def place_label_text(text_id: int, left: float, top: float, right: float) -> tuple[int, int, int, int] | None:
-            bbox = self.canvas.bbox(text_id)
-            if not bbox:
-                return None
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            canvas_w = max(1, self.canvas.winfo_width())
-            candidates: list[tuple[float, float]] = []
-            span = max(1.0, right - left)
-            for ratio in (0.0, 0.5, 1.0, 0.25, 0.75):
-                x = left + span * ratio
-                if ratio >= 1.0:
-                    x -= text_w + 8
-                elif ratio > 0:
-                    x -= text_w / 2
-                candidates.append((x, top - text_h - 6))
-            for row in range(1, 6):
-                candidates.append((left + (row - 1) * 18, top - (text_h + 6) * (row + 1)))
-            for x, y in candidates:
-                x = max(2, min(canvas_w - text_w - 2, int(round(x))))
-                y = max(2, int(round(y)))
-                rect = (x - 3, y - 2, x + text_w + 3, y + text_h + 2)
-                if not any(overlaps(rect, used) for used in used_text_rects):
-                    self.canvas.coords(text_id, x, y)
-                    used_text_rects.append(rect)
-                    return rect
-            x = max(2, min(canvas_w - text_w - 2, int(round(left))))
-            y = max(2, int(round(top - text_h - 6)))
-            rect = (x - 3, y - 2, x + text_w + 3, y + text_h + 2)
-            self.canvas.coords(text_id, x, y)
-            used_text_rects.append(rect)
-            return rect
 
         def to_canvas_pts(s: LabelShape) -> list[float]:
             coords: list[float] = []
@@ -6647,48 +6427,34 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 ])
             return coords
 
+        index_slot_width = max(24, 12 + 8 * max((len(str(s.class_id)) for s in gt + pred), default=1))
+
         def draw_shape(s: LabelShape, layer: str) -> None:
             if self.label_store.active_classes is not None and s.class_id not in self.label_store.active_classes:
                 return
-            color = self._label_color(s.class_id)
-            if dim and s is not self._focus_shape:
-                color = self._dim_color(color)
+            color = "#ef4444" if self._needs_review(s) else self._label_color(s.class_id)
             coords = to_canvas_pts(s)
             if len(coords) < 6:
                 return
-            if layer == "pred":
-                # pred：虚线细框 + "P: 类别 置信度"
-                poly_id = self.canvas.create_polygon(coords, outline=color, fill="", width=1, dash=(6, 4))
-                self._canvas_label_ids.append(poly_id)
-                line_id = self.canvas.create_line(coords + coords[:2], fill=color, width=1, dash=(6, 4))
-                self._canvas_label_ids.append(line_id)
-                text = f"P: {s.class_name}" + (f" {s.confidence:.2f}" if s.confidence else "")
-            else:
-                # gt：实线粗框 + "G: 类别"
-                poly_id = self.canvas.create_polygon(coords, outline=color, fill="", width=3)
-                self._canvas_label_ids.append(poly_id)
-                line_id = self.canvas.create_line(coords + coords[:2], fill=color, width=3)
-                self._canvas_label_ids.append(line_id)
-                text = f"G: {s.class_name}"
-            self._shape_item_map[poly_id] = s
+            xs, ys = coords[0::2], coords[1::2]
+            if max(xs) < 0 or max(ys) < 0 or min(xs) > self.canvas.winfo_width() or min(ys) > self.canvas.winfo_height():
+                return
+            width = 3 if s is self._focus_shape else 2
+            options = {"dash": (6, 4)} if layer == "pred" else {}
+            line_id = self._overlay_item((layer,id(s),"line"), "line", coords + coords[:2], fill=color, width=width, dash=(6,4) if layer=="pred" else ())
+            self._canvas_label_ids.append(line_id)
             self._shape_item_map[line_id] = s
-            for i in range(0, len(coords), 2):
-                x0, y0 = coords[i], coords[i + 1]
-                oval_id = self.canvas.create_oval(x0 - 2, y0 - 2, x0 + 2, y0 + 2, outline=color, fill="#ffffff", width=1)
-                self._canvas_label_ids.append(oval_id)
-                self._shape_item_map[oval_id] = s
-            left = min(coords[0::2])
-            right = max(coords[0::2])
-            top = min(coords[1::2])
-            text_id = self.canvas.create_text(0, 0, text=text, anchor="nw", fill="#ffffff", font=("Arial", 11, "bold"))
-            self._canvas_label_text_ids.append(text_id)
-            self._shape_item_map[text_id] = s
-            rect = place_label_text(text_id, left, top, right)
-            if rect:
-                bg = self.canvas.create_rectangle(rect[0], rect[1], rect[2], rect[3], fill=color, outline=color, width=1)
-                self._canvas_label_ids.append(bg)
-                self._shape_item_map[bg] = s
-                self.canvas.tag_lower(bg, text_id)
+            # Fixed-size index labels with separate G/P slots when boxes coincide.
+            offset = index_slot_width if layer == "pred" else 0
+            left = max(2, min(self.canvas.winfo_width()-2*index_slot_width-2, min(xs)+3)) + offset
+            top = max(2, min(self.canvas.winfo_height()-18, min(ys)+3))
+            chip = self._overlay_item((layer,id(s),"chip"), "rectangle", (left, top+3, left+6, top+9),
+                fill="#60a5fa" if layer == "gt" else "#fbbf24", outline="")
+            index = self._overlay_item((layer,id(s),"index"), "text", (left+9,top),
+                text=str(s.class_id), anchor="nw", fill=color, font=("Arial",9,"bold"))
+            for item in (chip,index):
+                self._canvas_label_ids.append(item)
+                self._shape_item_map[item] = s
 
         # 绘制顺序：先 pred（底层），后 gt（顶层），最后选中手柄
         if draw_pred:
@@ -6698,6 +6464,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
             for s in gt:
                 draw_shape(s, "gt")
 
+        self._prune_overlay_items()
         self._editor_draw_handles(self._edit_sel)
         self._editor_sync_object_list()
         self._editor_polygon_preview()
@@ -6789,12 +6556,19 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         buttons.pack(fill="x")
         ttk.Button(buttons, text="确定", command=confirm).pack(side="right", padx=(6, 0))
         ttk.Button(buttons, text="取消", command=cancel).pack(side="right")
+        choices = list(combo["values"])
+        def search(_event=None):
+            query = combo.get().strip().lower()
+            combo.configure(values=[v for v in choices if query in v.lower()] if query else choices)
+        combo.bind("<KeyRelease>", search)
         combo.bind("<Return>", confirm)
         # 下拉点选（单击/双击）即确认，无需再点「确定」
         combo.bind("<<ComboboxSelected>>", confirm)
         dialog.bind("<Escape>", cancel)
         dialog.update_idletasks()
-        dialog.geometry(f"+{self.root.winfo_rootx() + 120}+{self.root.winfo_rooty() + 160}")
+        x = min(self.root.winfo_pointerx(), max(0, dialog.winfo_screenwidth() - dialog.winfo_reqwidth() - 20))
+        y = min(self.root.winfo_pointery(), max(0, dialog.winfo_screenheight() - dialog.winfo_reqheight() - 50))
+        dialog.geometry(f"+{max(0,x)}+{max(0,y)}")
         dialog.wait_window()
         return result["cid"]
 
@@ -6806,7 +6580,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self._edit_drag["x"], self._edit_drag["y"] = event.x, event.y
         self.pan_x += dx
         self.pan_y += dy
-        self.render_image()
+        self._schedule_interaction_render()
 
     def _on_canvas_double_click(self, event):
         if self.editor_tool_var.get() == "多边形分割":
@@ -6833,7 +6607,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
     def _edit_delete_selected(self) -> None:
         if self._edit_sel is None or self._edit_sel not in self._edit_shapes:
             return
-        self._edit_undo.append(self._edit_snapshot())
+        self._push_edit_undo()
         if self._edit_sel.metadata.get("coco_rle"):
             ann_id = self._edit_sel.metadata.get("coco_annotation", {}).get("id")
             self._edit_shapes = [s for s in self._edit_shapes if s.metadata.get("coco_annotation", {}).get("id") != ann_id]
@@ -6847,7 +6621,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
     def _edit_set_class(self, class_id: int) -> None:
         if self._edit_sel is None or self._edit_sel not in self._edit_shapes:
             return
-        self._edit_undo.append(self._edit_snapshot())
+        self._push_edit_undo()
         self._edit_sel.class_id = class_id
         self._edit_sel.class_name = self.label_store.class_name(class_id)
         self._edit_dirty = True
@@ -6897,6 +6671,12 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 schema[str(target.relative_to(schema_path.parent))] = [shape.kind for shape in shapes]
                 atomic_json(schema_path, schema)
             self._edit_dirty = False
+            if hasattr(self, "_draft_store"):
+                try:
+                    self._draft_store.clear(path, self._draft_source())
+                except OSError as exc:
+                    get_logger().warning("标签已保存，但清理恢复草稿失败: %s", exc)
+            self._last_draft_signature = None
             self.label_store._label_cache.pop(path, None)
             self.label_store._source_by_image[path] = target
             self._label_cache.pop(path, None)
@@ -6931,7 +6711,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self.zoom = min(8.0, max(0.05, self.zoom * factor))
         self.pan_x = event.x - (event.x - self.pan_x) * (self.zoom / old_zoom)
         self.pan_y = event.y - (event.y - self.pan_y) * (self.zoom / old_zoom)
-        self.render_image()
+        self._schedule_interaction_render()
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self.drag_start = (event.x, event.y)
@@ -6944,7 +6724,7 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         self.drag_start = (event.x, event.y)
         self.pan_x += dx
         self.pan_y += dy
-        self.render_image()
+        self._schedule_interaction_render()
 
     def select_label_dir(self) -> None:
         path = filedialog.askdirectory(title="选择 YOLO / LabelMe 标注目录", initialdir=self.label_dir_var.get() or None)
@@ -7384,7 +7164,10 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 self._render_class_filter_frame(frame)
 
     def _label_color(self, class_id: int) -> str:
-        palette = ["#ff5252", "#00bcd4", "#ffc107", "#4caf50", "#e040fb", "#ff9800", "#40c4ff"]
+        # Reserve red for annotations that need review.
+        palette = ("#2463ff", "#00b8e6", "#e5a900", "#00b83f", "#a020f0",
+                   "#ff8000", "#4651bd", "#94be00", "#d12fe0", "#995a00",
+                   "#008d78", "#1a547c")
         return palette[class_id % len(palette)]
 
     def _sync_class_filter(self) -> None:
@@ -7409,8 +7192,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
             old_var = existing_vars.get(cls)
             if old_var is not None:
                 new_vars[cls] = old_var
-            elif first_init and isinstance(saved_active_config, list):
-                new_vars[cls] = BooleanVar(value=cls in saved_active)
+            elif first_init:
+                new_vars[cls] = BooleanVar(value=True)
             else:
                 # New classes discovered while browsing stay visible by default.
                 new_vars[cls] = BooleanVar(value=True)
@@ -8303,16 +8086,33 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
     def _submit_background(self, func, *args) -> Future | None:
         if getattr(self, "_closing", False):
             return None
+        pending = getattr(self, "_background_futures", set())
+        if len(pending) >= 8:
+            return None
         try:
-            return self._executor.submit(func, *args)
+            future = self._executor.submit(func, *args)
         except RuntimeError:
             return None
+        pending.add(future)
+        def done(completed):
+            pending.discard(completed)
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None and not self._closing:
+                    self.task_queue.put(("background_error", str(error)))
+        future.add_done_callback(done)
+        return future
 
     def _run_thread(self, func, *args) -> None:
         if getattr(self, "_closing", False):
             return
-        thread = threading.Thread(target=func, args=args, daemon=True)
-        thread.start()
+        def run():
+            try:
+                func(*args)
+            except Exception as exc:
+                if not self._closing:
+                    self.task_queue.put(("background_error", str(exc)))
+        threading.Thread(target=run, daemon=True).start()
 
     def _drain_queue(self) -> None:
         if getattr(self, "_closing", False):
@@ -8333,17 +8133,37 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 except Exception as exc:
                     log.error("队列消息派发失败: kind=%s err=%s\n%s",
                               kind, exc, traceback.format_exc())
+                    if kind != "background_error":
+                        self.task_queue.put(("background_error", f"{kind}: {exc}"))
         except queue.Empty:
             pass
         # 再次 schedule（即便上面有异常，下一帧还能继续）
         try:
-            self._drain_after_id = self.root.after(50, self._drain_queue)
+            self._drain_after_id = self.root.after(16 if getattr(self, "_viewport_future", None) is not None else 50, self._drain_queue)
         except Exception:
             pass
 
     def _dispatch_queue_message(self, kind: str, payload: object) -> None:
         """单条 task_queue 消息的派发（拆出来便于加 try/except 隔离）。"""
-        if kind == "conversion_done":
+        if kind == "original_loaded":
+            self._apply_original_loaded(payload)
+        elif kind == "nearby_preview":
+            self._apply_nearby_preview(payload)
+        elif kind == "slider_preview":
+            self._apply_slider_preview(payload)
+        elif kind == "review_ready":
+            self._apply_review_result(payload)
+        elif kind == "label_import_checked":
+            self._finish_label_import(payload)
+        elif kind == "viewport_ready":
+            self._apply_viewport_result(payload)
+        elif kind == "background_error":
+            self._show_task_error(str(payload))
+        elif kind == "image_ready":
+            self._on_image_loaded(payload)
+        elif kind == "image_failed":
+            self._skip_corrupted_image(*payload)
+        elif kind == "conversion_done":
             self._show_conversion_result(*payload)
         elif kind == "conversion_error":
             self._conversion_running = False
@@ -8494,6 +8314,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
                 self.label_tree.delete(*self.label_tree.get_children())
                 for idx, status, image_name, label_info in rows:
                     self.label_tree.insert("", "end", iid=str(idx), values=(status, image_name, label_info))
+                self._label_scan_active = False
+                self._refresh_context_actions()
                 self.log_label(f"后台匹配完成：{matched}/{total} 张图片已导入标签")
                 self._update_module_status("labels", f"[标签] 后台匹配完成：{matched}/{total} 张图片已导入标签", 100, log=True)
                 if hasattr(self, "label_progress_frame"):
@@ -8539,6 +8361,8 @@ class TkImageBrowser(AnnotationWorkflowMixin, AnnotationEditorMixin, WorkspaceMi
         if not self._resolve_pending_edits():
             return
         self._closing = True
+        self._close_image_pipeline()
+        self._release_review_resources()
         self._dir_scan_token += 1
         self._current_loading_path = ""
         try:
@@ -8708,7 +8532,7 @@ def _print_version(all_versions: bool = False) -> None:
     _safe_print(f"图片浏览器 {VERSION}  ({AUTHOR} · {UPDATE_DATE})")
     entries = _load_version_log()
     if not entries:
-        _safe_print("(未找到 VERSION_LOG.md)")
+        _safe_print("(暂无版本日志)")
         return
     if not all_versions:
         latest = entries[0]

@@ -49,10 +49,10 @@ class AnnotationEditorMixin:
                 return math.hypot(mx-ax-t*dx, my-ay-t*dy)
             edge = min(range(len(pts)), key=distance_to_edge)
             if distance_to_edge(edge) <= 12:
-                self._edit_undo.append(self._edit_snapshot())
+                self._push_edit_undo()
                 pts.insert(edge + 1, point)
                 self._edit_dirty = True
-                self.render_image()
+                self._schedule_interaction_render()
             return
         if tool == "多边形分割":
             point = self._canvas_to_norm(mx, my)
@@ -88,12 +88,12 @@ class AnnotationEditorMixin:
                 index = int(handle[6:])
                 if self._edit_sel.kind == "segment" and getattr(event, "state", 0) & 4:
                     if len(self._edit_sel.points) > 3:
-                        self._edit_undo.append(self._edit_snapshot())
+                        self._push_edit_undo()
                         self._edit_sel.points.pop(index)
                         self._edit_dirty = True
-                        self.render_image()
+                        self._schedule_interaction_render()
                     return
-                self._edit_undo.append(self._edit_snapshot())
+                self._push_edit_undo()
                 self._edit_drag = {"mode": "resize", "handle": index, "shape": self._edit_sel,
                                    "start_points": list(self._edit_sel.points)}
                 return
@@ -101,26 +101,15 @@ class AnnotationEditorMixin:
                 points = self._edit_sel.points
                 center = (sum(x for x, _ in points) / 4, sum(y for _, y in points) / 4)
                 cx, cy = self._editor_to_canvas(center)
-                self._edit_undo.append(self._edit_snapshot())
+                self._push_edit_undo()
                 self._edit_drag = {"mode": "rotate", "shape": self._edit_sel, "center": center,
                                    "angle": math.atan2(my - cy, mx - cx), "start_points": list(points)}
                 return
-        shape = next((self._shape_item_map[iid] for iid in reversed(hits) if iid in self._shape_item_map), None)
-        if shape is None:
-            # 允许在目标内部选中，而不必精确点到边界。
-            for candidate in reversed(self._edit_shapes):
-                if self.label_store.active_classes is not None and candidate.class_id not in self.label_store.active_classes:
-                    continue
-                import cv2
-                import numpy as np
-                polygon = np.asarray([self._editor_to_canvas(p) for p in candidate.points], dtype=np.float32)
-                if len(polygon) >= 3 and cv2.pointPolygonTest(polygon, (float(mx), float(my)), False) >= 0:
-                    shape = candidate
-                    break
+        shape = self._pick_canvas_shape(mx, my)
         self._focus_shape = shape
         self._edit_sel = shape if shape in self._edit_shapes else None
         if self._edit_sel is not None and not shape.metadata.get("rle_has_holes"):
-            self._edit_undo.append(self._edit_snapshot())
+            self._push_edit_undo()
             self._edit_drag = {"mode": "move", "shape": shape, "start_norm": self._canvas_to_norm(mx, my),
                                "start_points": list(shape.points)}
         elif self._edit_sel is None:
@@ -136,7 +125,7 @@ class AnnotationEditorMixin:
             self.pan_x += event.x - drag["x"]
             self.pan_y += event.y - drag["y"]
             drag["x"], drag["y"] = event.x, event.y
-            self.render_image()
+            self._schedule_interaction_render()
         elif mode == "new":
             self.canvas.coords(self._rubber_id, drag["x0"], drag["y0"], event.x, event.y)
         elif mode == "move":
@@ -146,11 +135,11 @@ class AnnotationEditorMixin:
             dx, dy = max(-x1, min(1 - x2, dx)), max(-y1, min(1 - y2, dy))
             drag["shape"].points = [(x + dx, y + dy) for x, y in drag["start_points"]]
             self._edit_dirty = True
-            self.render_image()
+            self._schedule_interaction_render()
         elif mode == "resize":
             self._apply_handle_resize(drag["shape"], drag["handle"], self._canvas_to_norm(event.x, event.y))
             self._edit_dirty = True
-            self.render_image()
+            self._schedule_interaction_render()
         elif mode == "rotate":
             cx, cy = self._editor_to_canvas(drag["center"])
             angle = math.atan2(event.y - cy, event.x - cx) - drag["angle"]
@@ -163,11 +152,13 @@ class AnnotationEditorMixin:
             if all(self._point_inside_image(p) for p in result):
                 drag["shape"].points = result
                 self._edit_dirty = True
-                self.render_image()
+                self._schedule_interaction_render()
 
     def _editor_release(self, event):
         drag = self._edit_drag
         self._edit_drag = None
+        if drag and drag["mode"] != "new":
+            self.render_image()
         if drag and drag["mode"] == "new":
             if self._rubber_id is not None:
                 self.canvas.delete(self._rubber_id)
@@ -180,12 +171,16 @@ class AnnotationEditorMixin:
 
     def _editor_commit(self, kind, points):
         from pathlib import Path
+        cid = self._class_pick_dialog("选择标注类别", current_class_id=self._draw_class_id)
+        if cid is None:
+            self._editor_cancel_drawing()
+            return
+        self._draw_class_id = cid
         if not self._has_label_source():
             # 新标注默认使用原生 JSON，可混合保存三种类型。
             self.label_dir_var.set(str(Path(self.image_paths[self.current_index]).parent))
             self.label_format_var.set("labelme")
-        self._edit_undo.append(self._edit_snapshot())
-        cid = self._draw_class_id
+        self._push_edit_undo()
         shape = LabelShape(cid, self.label_store.ensure_class_id(cid), kind, list(points))
         self._edit_shapes.append(shape)
         self._edit_sel = self._focus_shape = shape
@@ -293,24 +288,44 @@ class AnnotationEditorMixin:
     def _editor_sync_object_list(self):
         if not hasattr(self, "_object_tree"):
             return
-        self._object_tree.delete(*self._object_tree.get_children())
-        self._object_shapes = list(self._edit_shapes)
-        for i, shape in enumerate(self._object_shapes):
-            kind = {"detect": "HBB", "obb": "OBB", "segment": "分割"}.get(shape.kind, shape.kind)
-            self._object_tree.insert("", "end", iid=str(i), values=(shape.class_name, kind, len(shape.points)))
-            if shape is self._edit_sel:
-                self._object_tree.selection_set(str(i))
+        shapes = list(self._edit_shapes) + list(getattr(self, "_cur_pred_shapes", []))
+        signature = tuple((id(s), s.class_name, s.kind, s.confidence) for s in shapes)
+        if signature != getattr(self, "_object_list_signature", None):
+            self._object_list_signature = signature
+            self._object_tree.delete(*self._object_tree.get_children())
+            self._object_shapes = shapes
+            for i, shape in enumerate(shapes):
+                kind = {"detect": "HBB", "obb": "OBB", "segment": "分割"}.get(shape.kind, shape.kind)
+                source = "G" if any(shape is s for s in self._edit_shapes) else "P"
+                self._object_tree.insert("", "end", iid=str(i), values=(shape.class_name, kind, source))
+        focus = self._focus_shape
+        selected = next((str(i) for i,s in enumerate(shapes) if s is focus), None)
+        if selected is not None and self._object_tree.selection() != (selected,):
+            self._object_tree.selection_set(selected)
+        elif selected is None and self._object_tree.selection():
+            self._object_tree.selection_remove(*self._object_tree.selection())
+        if hasattr(self, "_selection_detail"):
+            text = "选择标注查看详情"
+            if focus is not None:
+                source = "人工" if any(focus is s for s in self._edit_shapes) else "预测"
+                score = f" · 置信度 {focus.confidence:.3f}" if focus.confidence is not None else ""
+                text = f"{source} · {focus.class_name}{score}"
+            if getattr(self,"_comparison_pending",False): text += " · 核对中"
+            self._selection_detail.set(text)
+        self._refresh_context_actions()
 
     def _editor_select_object(self, _event=None):
         selection = self._object_tree.selection()
         if selection:
             shape = self._object_shapes[int(selection[0])]
-            if shape is not self._edit_sel:
-                self._edit_sel = self._focus_shape = shape
+            if shape is not self._focus_shape:
+                self._focus_shape = shape
+                self._edit_sel = shape if any(shape is s for s in self._edit_shapes) else None
                 self.editor_tool_var.set("选择 / 编辑")
                 self.edit_mode_var.set(True)
                 self._editor_update_hint()
-                self.render_image()
+                self._center_on_shape(shape)
+                self._schedule_interaction_render()
 
     def _editor_edit_class(self, _event=None):
         if self._edit_sel is None:

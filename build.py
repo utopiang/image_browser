@@ -10,6 +10,30 @@ import sys
 from pathlib import Path
 
 
+def _sync_embedded_version_log(root: Path) -> None:
+    """Refresh embedded history at build time; runtime needs no Markdown file."""
+    import ast
+
+    source = root / "VERSION_LOG.md"
+    if not source.is_file():
+        return  # Existing embedded history supports source distributions without Markdown.
+    content = source.read_text(encoding="utf-8")
+    from version_log import parse_version_log
+    if not parse_version_log(source):
+        raise ValueError("VERSION_LOG.md contains no release entries")
+    target = root / "version_log.py"
+    module = target.read_text(encoding="utf-8")
+    for node in ast.parse(module).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "EMBEDDED_VERSION_LOG" for t in node.targets
+        ):
+            lines = module.splitlines(keepends=True)
+            lines[node.lineno - 1:node.end_lineno] = ["EMBEDDED_VERSION_LOG = " + repr(content) + "\n"]
+            target.write_text("".join(lines), encoding="utf-8")
+            return
+    raise RuntimeError("Embedded version history constant is missing")
+
+
 def _get_version() -> str:
     version_file = Path(__file__).parent / "src" / "tk_app.py"
     for line in version_file.read_text(encoding="utf-8").splitlines():
@@ -126,6 +150,7 @@ def _print_linux_dependency_note(onefile: bool) -> None:
 
 def build(console: bool = False, onefile: bool = True) -> None:
     root = Path(__file__).parent
+    _sync_embedded_version_log(root)
     version = _get_version()
     is_linux = sys.platform.startswith("linux")
 

@@ -24,6 +24,8 @@ class WorkspaceTests(unittest.TestCase):
         self.app.root.report_callback_exception = lambda *error: self.errors.append(error)
         self.app._preload_surrounding = lambda *args: None
         self.app._schedule_pre_render = lambda: None
+        self.class_picker = patch.object(self.app, "_class_pick_dialog", return_value=0)
+        self.class_picker.start()
         self.images = self.base / "images"
         self.labels = self.base / "labels"
         self.images.mkdir()
@@ -49,10 +51,217 @@ class WorkspaceTests(unittest.TestCase):
         self.app._edit_dirty = False
         with patch("src.tk_app.threading.Timer"):
             self.app._on_close()
+        self.class_picker.stop()
         self.config_path.stop()
         self.config_dir.stop()
         self.temp.cleanup()
         self.assertEqual(self.errors, [], "Tk 回调不应出现异常")
+
+    def test_cancel_new_shape_keeps_annotations_and_undo(self):
+        before=self.app._edit_snapshot()
+        self.app._class_pick_dialog.return_value=None
+        self.app._editor_commit("detect",[(.1,.1),(.2,.1),(.2,.2),(.1,.2)])
+        self.assertEqual(self.app._edit_shapes,before)
+        self.assertFalse(self.app._edit_undo)
+        self.assertFalse(hasattr(self.app,"_draw_class_combo"))
+
+    def test_prediction_review_accept_and_undo(self):
+        predictions=self.base/"predictions";predictions.mkdir()
+        (predictions/"tunnel_01.txt").write_text("0 0.2 0.2 0.1 0.1 0.9\n",encoding="utf-8")
+        self.app.pred_label_dir_var.set(str(predictions))
+        self.app.render_image()
+        prediction=self.app._cur_pred_shapes[0]
+        self.assertTrue(self.app._needs_review(prediction))
+        self.app._focus_shape=prediction
+        self.app._confirm_review()
+        self.assertFalse(self.app._needs_review(prediction))
+        before=self.app._edit_snapshot()
+        self.app._accept_prediction()
+        self.assertEqual(len(self.app._edit_shapes),len(before)+1)
+        self.assertTrue(self.app._edit_dirty)
+        self.app._edit_undo_pop()
+        self.assertEqual(self.app._edit_shapes,before)
+        self.assertTrue(self.app._needs_review(self.app._cur_pred_shapes[0]))
+        self.assertFalse(self.app._canvas_label_text_ids)
+
+    def test_undo_history_and_image_cache_have_limits(self):
+        for _ in range(40): self.app._push_edit_undo()
+        self.assertEqual(len(self.app._edit_undo),30)
+        for i in range(12):
+            self.app._cache_loaded_image(str(i),Image.new("RGB",(100,100)))
+        self.assertLessEqual(len(self.app._image_cache),6)
+
+    def test_async_viewport_discards_obsolete_results(self):
+        import time
+        self.app.root.geometry("1440x900")
+        self.app.root.deiconify();self.app.root.update()
+        self.app.zoom=8
+        self.app.pan_x=-100;self.app.pan_y=-100
+        self.app.render_image()
+        self.app.pan_x=-200
+        self.app.render_image()
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            self.app.root.update()
+            if self.app._viewport_key==self.app._viewport_requested: break
+            time.sleep(.01)
+        self.assertEqual(self.app._viewport_key,self.app._viewport_requested)
+        self.assertLessEqual(self.app.tk_image.width(),self.app.canvas.winfo_width())
+        self.assertLessEqual(self.app.tk_image.height(),self.app.canvas.winfo_height())
+
+    def test_unified_import_validates_ids_then_reuses_current_classes(self):
+        import time
+        from tkinter import ttk
+        import tkinter as tk
+        self.app.show_label_import()
+        dialog=next(w for w in self.app.root.winfo_children() if isinstance(w,tk.Toplevel))
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets=list(descendants(dialog))
+        entry=next(w for w in widgets if isinstance(w,ttk.Entry) and not isinstance(w,ttk.Combobox))
+        entry.insert(0,str(self.labels))
+        combos=[w for w in widgets if isinstance(w,ttk.Combobox)]
+        combos[-1].set("使用当前类别表")
+        button=next(w for w in widgets if isinstance(w,ttk.Button) and w.cget("text")=="导入")
+        file=self.labels/"tunnel_01.txt"
+        file.write_text("9 0.5 0.5 0.4 0.4\n",encoding="utf-8")
+        button.invoke()
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline and button.instate(["disabled"]):
+            self.app.root.update();time.sleep(.01)
+        self.assertTrue(dialog.winfo_exists())
+        messages=[str(self.app.root.getvar(w.cget("textvariable"))) for w in widgets if isinstance(w,ttk.Label) and w.cget("textvariable")]
+        self.assertTrue(any("超出类别表范围" in m for m in messages),messages)
+        file.write_text("0 0.5 0.5 0.4 0.4\n",encoding="utf-8")
+        button.invoke()
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline and dialog.winfo_exists():
+            self.app.root.update();time.sleep(.01)
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.app.label_store.classes,["crack"])
+        self.assertIsNone(self.app.label_store.active_classes)
+
+    def test_overlapping_sources_cycle_without_moving_boxes(self):
+        predictions=self.base/"predictions";predictions.mkdir()
+        (predictions/"tunnel_01.txt").write_text("0 0.5 0.5 0.4 0.4 0.9\n",encoding="utf-8")
+        self.app.pred_label_dir_var.set(str(predictions))
+        self.app.render_image()
+        x,y=self.app._editor_to_canvas((.5,.5))
+        first=self.app._pick_canvas_shape(x,y)
+        self.app._focus_shape=first
+        second=self.app._pick_canvas_shape(x,y)
+        self.assertIsNotNone(first);self.assertIsNotNone(second)
+        self.assertIsNot(first,second)
+        self.assertEqual(first.points,second.points)
+
+    def test_slider_scrub_only_commits_last_target(self):
+        before=self.app.current_index
+        self.app._slider_press()
+        with patch.object(self.app,"show_current_image",wraps=self.app.show_current_image) as show:
+            for value in range(0,1001,10): self.app._on_image_scale_change(str(value))
+            self.assertEqual(self.app.current_index,before)
+            self.assertEqual(show.call_count,0)
+            self.app._slider_release()
+            self.assertEqual(show.call_count,1)
+            self.assertEqual(self.app.current_index,len(self.paths)-1)
+        self.assertIsNone(self.app._slider_target)
+
+    def test_nearby_cache_contains_only_two_small_previews(self):
+        import time
+        self.app.current_index=1
+        self.app._image_loading=False
+        self.app._load_nearby_previews()
+        deadline=time.monotonic()+3
+        while len(self.app._preview_cache)<2 and time.monotonic()<deadline:
+            self.app.root.update();time.sleep(.01)
+        self.assertEqual(set(self.app._preview_cache),{self.paths[0],self.paths[2]})
+        self.app.current_index=2
+        self.app._load_nearby_previews()
+        deadline=time.monotonic()+3
+        while set(self.app._preview_cache)!={self.paths[1],self.paths[3]} and time.monotonic()<deadline:
+            self.app.root.update();time.sleep(.01)
+        self.assertEqual(set(self.app._preview_cache),{self.paths[1],self.paths[3]})
+
+    def test_async_original_loader_keeps_only_current_full_image(self):
+        import time
+        self.app._image_cache.clear()
+        self.app.current_index=2
+        self.app.show_current_image()
+        self.app.current_index=3
+        self.app.show_current_image()
+        deadline=time.monotonic()+3
+        while (self.app._image_loading or self.app.current_image is None) and time.monotonic()<deadline:
+            self.app.root.update();time.sleep(.01)
+        self.assertEqual(set(self.app._image_cache),{self.paths[3]})
+        self.assertIs(self.app.current_image,self.app._image_cache[self.paths[3]])
+
+    def test_context_buttons_show_only_for_applicable_selection(self):
+        self.app._focus_shape=None
+        self.app._refresh_context_actions()
+        self.assertFalse(self.app._accept_prediction_button.winfo_manager())
+        self.assertFalse(self.app._confirm_review_button.winfo_manager())
+        self.app._scan_active=True
+        self.app._refresh_context_actions()
+        self.assertEqual(self.app._cancel_scan_button.winfo_manager(),"pack")
+        self.app._scan_active=False
+        self.app._refresh_context_actions()
+        self.assertFalse(self.app._cancel_scan_button.winfo_manager())
+
+    def test_recovery_draft_can_be_restored_without_overwriting_labels(self):
+        import time
+        shape=self.app._edit_shapes[0]
+        shape.class_name="water"
+        original=(self.labels/"tunnel_01.txt").read_text(encoding="utf-8")
+        self.app._draft_store.save(self.paths[0],str(self.labels),[shape])
+        draft=self.app._draft_store.path_for(self.paths[0],str(self.labels))
+        deadline=time.monotonic()+2
+        while not draft.exists() and time.monotonic()<deadline: time.sleep(.01)
+        self.app._draft_seen.clear()
+        self.app._edit_dirty=False
+        with patch("src.review_ui.messagebox.askyesnocancel",return_value=True):
+            self.app._offer_recovery_draft(self.paths[0])
+        self.assertTrue(self.app._edit_dirty)
+        self.assertEqual(self.app._edit_shapes[0].class_name,"water")
+        self.assertEqual((self.labels/"tunnel_01.txt").read_text(encoding="utf-8"),original)
+
+    def test_panning_reuses_annotation_canvas_items(self):
+        self.app.render_image()
+        before=set(self.app._canvas_label_ids)
+        self.app.pan_x+=1
+        self.app.render_image()
+        self.assertEqual(set(self.app._canvas_label_ids),before)
+
+    def test_large_comparison_uses_worker_and_ignores_old_result(self):
+        import copy,time
+        original=self.app._edit_shapes[0]
+        gt=[copy.deepcopy(original) for _ in range(9)]
+        pred=[copy.deepcopy(original) for _ in range(9)]
+        self.app.pred_label_dir_var.set(str(self.labels))
+        self.app._update_review_comparison(gt,pred,self.paths[0])
+        ticket=self.app._comparison_ticket
+        self.assertTrue(self.app._comparison_pending)
+        self.app._update_review_comparison([],[],self.paths[1])
+        self.app._apply_review_result((ticket,{id(original)},{}))
+        self.assertFalse(self.app._review_abnormal)
+
+    def test_repeated_full_image_jumps_leave_bounded_cache_and_stop_workers(self):
+        import time
+        self.app._image_cache.clear()
+        for _ in range(5):
+            self.app._slider_press()
+            for value in (100,900,300,700,1000):
+                self.app._on_image_scale_change(str(value))
+            self.app._slider_release()
+            deadline=time.monotonic()+2
+            while self.app._image_loading and time.monotonic()<deadline:
+                self.app.root.update();time.sleep(.01)
+            self.assertLessEqual(len(self.app._image_cache),1)
+        self.app._close_image_pipeline()
+        for worker in (self.app._full_loader,self.app._preview_loader):
+            worker.thread.join(1)
+            self.assertFalse(worker.thread.is_alive())
 
     def test_sections_share_picture_and_return_from_tools(self):
         self.app.current_index = 2
@@ -61,15 +270,15 @@ class WorkspaceTests(unittest.TestCase):
             self.app.show_panel(section)
             self.assertEqual(self.app.current_index, 2)
             # body 只剩 中央画布 + 右栏（图片库在右栏下半区，随模块切换显隐）
-            self.assertEqual(len(self.app.body.panes()), 2)
+            self.assertEqual(len(self.app.body.panes()), 3)
             self.assertEqual(self.app._tool_bar.winfo_manager(), "pack")
-            self.assertIn(str(self.app._library_pane), self.app._right_paned.panes())
+            self.assertIn(str(self.app._library_pane), self.app.body.panes())
         self.app.show_panel("video")
         self.assertEqual(len(self.app.body.panes()), 1)
         self.assertEqual(self.app._tool_bar.winfo_manager(), "")
         self.app.show_panel("dedupe")
         self.assertEqual(len(self.app.body.panes()), 2)
-        self.assertNotIn(str(self.app._library_pane), self.app._right_paned.panes())
+        self.assertNotIn(str(self.app._library_pane), self.app.body.panes())
         self.app.image_paths = ["dedupe-result.jpg"]
         self.app.current_index = 0
         self.app.show_panel("workspace")
